@@ -1,0 +1,1040 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Meeting Copilot</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: rgba(255,255,255,.06);
+      --panel2: rgba(255,255,255,.09);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.65);
+      --border: rgba(255,255,255,.12);
+      --me: #2fe08c;
+      --other: #4aa8ff;
+      --warn: #ffcc66;
+      --err: #ff6b6b;
+      --shadow: 0 12px 40px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 800px at 20% 20%, rgba(74,168,255,.25), transparent 55%),
+                  radial-gradient(1000px 700px at 85% 30%, rgba(47,224,140,.18), transparent 55%),
+                  var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    header {
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      position: sticky;
+      top: 0;
+      backdrop-filter: blur(12px);
+      background: rgba(11,16,32,.55);
+      border-bottom: 1px solid var(--border);
+      z-index: 10;
+    }
+    .title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .title h1 {
+      font-size: 15px;
+      margin: 0;
+      letter-spacing: .2px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .pill {
+      font-size: 11px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.03);
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .pill select {
+      background: transparent;
+      color: inherit;
+      border: none;
+      font-size: inherit;
+      font-family: inherit;
+      cursor: pointer;
+      max-width: 150px;
+      text-overflow: ellipsis;
+    }
+    .pill-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-left: 2px;
+    }
+    .pill-btn:hover {
+      background: rgba(255,255,255,.1);
+    }
+    main {
+      padding: 16px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    .right-column {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: 140px;
+    }
+    .cardHeader {
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,.03);
+    }
+    .cardHeader strong { font-size: 13px; letter-spacing: .2px; }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    button {
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.05);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: .12s transform ease, .12s background ease, .12s border-color ease;
+      user-select: none;
+    }
+    button:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.20); }
+    button:active { transform: translateY(1px); }
+    button.primary { border-color: rgba(74,168,255,.35); background: rgba(74,168,255,.12); }
+    button.good { border-color: rgba(47,224,140,.35); background: rgba(47,224,140,.10); }
+    button.warn { border-color: rgba(255,204,102,.40); background: rgba(255,204,102,.10); }
+    button.danger { border-color: rgba(255,107,107,.40); background: rgba(255,107,107,.10); }
+    button[disabled] { opacity: .55; cursor: not-allowed; }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr;
+    }
+    #timeline {
+      height: calc(100vh - 170px);
+      overflow: auto;
+      padding: 10px 12px 14px;
+    }
+    .line {
+      display: grid;
+      grid-template-columns: 70px 1fr;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px dashed rgba(255,255,255,.09);
+    }
+    .speaker {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .4px;
+      opacity: .95;
+      align-self: start;
+    }
+    .speaker.me { color: var(--me); }
+    .speaker.other { color: var(--other); }
+    .msg {
+      font-size: 14px;
+      line-height: 1.35;
+      color: rgba(255,255,255,.9);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg.interim { color: rgba(255,255,255,.62); font-style: italic; }
+    .small {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    #suggestions {
+      padding: 10px 12px 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .suggestBlock {
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.04);
+      border-radius: 12px;
+      padding: 10px 10px;
+    }
+    .suggestBlock h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      letter-spacing: .25px;
+      color: rgba(255,255,255,.85);
+      text-transform: uppercase;
+    }
+    .suggestText { white-space: pre-wrap; font-size: 14px; line-height: 1.35; }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .statusDot {
+      width: 8px; height: 8px;
+      border-radius: 999px;
+      display: inline-block;
+      background: rgba(255,255,255,.25);
+      box-shadow: 0 0 0 3px rgba(255,255,255,.06);
+      margin-right: 8px;
+    }
+    .statusDot.on { background: var(--me); box-shadow: 0 0 0 3px rgba(47,224,140,.20); }
+    .statusDot.off { background: var(--err); box-shadow: 0 0 0 3px rgba(255,107,107,.20); }
+    .kbd {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.04);
+      color: rgba(255,255,255,.75);
+    }
+    .error {
+      color: var(--err);
+      font-size: 12px;
+      padding: 8px 10px;
+      border-top: 1px solid rgba(255,255,255,.10);
+      background: rgba(255,107,107,.10);
+      display: none;
+    }
+    .thinking {
+      color: var(--warn);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.4; }
+      50% { opacity: 1; }
+    }
+    @keyframes dots {
+      0%, 20% { content: '.'; }
+      40% { content: '..'; }
+      60%, 100% { content: '...'; }
+    }
+    .thinking-dots::after {
+      content: '';
+      animation: dots 1.5s steps(1) infinite;
+    }
+    .btn-loading {
+      position: relative;
+      pointer-events: none;
+      opacity: 0.7;
+    }
+    .btn-loading::after {
+      content: '';
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      top: 50%;
+      right: 8px;
+      margin-top: -7px;
+      border: 2px solid transparent;
+      border-top-color: currentColor;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    @media (max-width: 1100px) {
+      header {
+        justify-content: center;
+      }
+      .title {
+        justify-content: center;
+        width: 100%;
+      }
+      .controls {
+        justify-content: center;
+        width: 100%;
+      }
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      #timeline { height: 50vh; }
+      .pill { font-size: 10px; padding: 2px 6px; }
+      button { font-size: 12px; padding: 6px 8px; }
+    }
+    @media (max-width: 600px) {
+      header { padding: 10px 12px; gap: 8px; }
+      .title h1 { font-size: 14px; }
+      .pill select { max-width: 100px; }
+    }
+    .chatBubble {
+      padding: 8px 12px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.4;
+      max-width: 95%;
+      word-wrap: break-word;
+    }
+    .chatBubble.user {
+      background: rgba(74,168,255,.15);
+      border: 1px solid rgba(74,168,255,.25);
+      align-self: flex-end;
+      color: var(--other);
+    }
+    .chatBubble.assistant {
+      background: rgba(47,224,140,.10);
+      border: 1px solid rgba(47,224,140,.20);
+      align-self: flex-start;
+      color: var(--text);
+    }
+    .chatBubble.loading {
+      background: rgba(255,204,102,.10);
+      border: 1px solid rgba(255,204,102,.20);
+      color: var(--warn);
+    }
+    select option {
+      background: #1a1f2e;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <h1>Meeting Copilot</h1>
+      <span class="pill"><span class="statusDot" id="dot"></span><span id="running">offline</span></span>
+      <span class="pill">
+        <select id="meetingSel">
+          <option value="">Chargement...</option>
+        </select>
+        <button id="btnNewMeeting" class="pill-btn">+</button>
+      </span>
+      <span class="pill">
+        Profil:
+        <select id="profileSel">
+          <option value="">(aucun)</option>
+        </select>
+      </span>
+      <span class="pill">
+        Loopback:
+        <select id="loopSel">
+          <option value="">Chargement...</option>
+        </select>
+      </span>
+      <span class="pill">Langue: <strong id="lang">—</strong></span>
+      <span class="pill">Hotkey: <span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">Space</span></span>
+    </div>
+    <div class="controls">
+      <button class="good" id="btnStart">Start</button>
+      <button class="danger" id="btnStop">Stop</button>
+      <button id="btnReset">Reset</button>
+      <button id="btnSpeakerMode" style="min-width: 80px;">🔄 Auto</button>
+      <button id="btnToggleSpeaker" class="primary" style="min-width: 140px; display: none;">🎤 ME (moi)</button>
+      <button class="primary" id="btnFR">FR</button>
+      <button class="primary" id="btnEN">EN</button>
+      <button class="warn" id="btnAsk">Proposer une réponse</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="cardHeader">
+        <strong>Timeline</strong>
+        <span class="small">ME = micro | OTHER = loopback</span>
+      </div>
+      <div id="timeline"></div>
+      <div class="error" id="errBox"></div>
+    </section>
+
+    <div class="right-column">
+      <section class="card">
+        <div class="cardHeader">
+          <strong>Suggestions</strong>
+          <span class="small">Copie rapide</span>
+        </div>
+        <div id="suggestions">
+          <div class="suggestBlock">
+            <h3>Meilleure réponse (concise)</h3>
+            <div class="suggestText" id="best">—</div>
+            <div class="row">
+              <button id="copyBest">Copier</button>
+            </div>
+          </div>
+          <div class="suggestBlock">
+            <h3>Alternative (plus détaillée)</h3>
+            <div class="suggestText" id="altLong">—</div>
+            <div class="row">
+              <button id="copyAltLong">Copier</button>
+            </div>
+          </div>
+          <div class="suggestBlock">
+            <h3>Question de clarification (si besoin)</h3>
+            <div class="suggestText" id="clarify">—</div>
+            <div class="row">
+              <button id="copyClarify">Copier</button>
+            </div>
+          </div>
+          <div class="suggestBlock">
+            <h3>📚 Concepts techniques expliqués</h3>
+            <div class="suggestText" id="techTerms" style="font-size: 13px;">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" style="display: flex; flex-direction: column;">
+        <div class="cardHeader">
+          <strong>💬 Assistant</strong>
+          <span class="small">Pose une question sur la discussion</span>
+        </div>
+        <div id="chatMessages" style="
+          flex: 1;
+          overflow: auto;
+          padding: 10px 12px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          min-height: 150px;
+          max-height: 250px;
+        ">
+          <div class="chatWelcome" style="color: var(--muted); font-size: 13px; text-align: center; padding: 20px;">
+            Pose une question sur la conversation en cours.<br>
+            Ex: "Comment répondre à sa question sur le ML?", "Résume ce qui a été dit"
+          </div>
+        </div>
+        <div style="padding: 10px 12px; border-top: 1px solid var(--border); display: flex; gap: 8px;">
+          <input type="text" id="chatInput" placeholder="Ta question..." style="
+            flex: 1;
+            background: rgba(255,255,255,.06);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: var(--text);
+            font-size: 14px;
+            outline: none;
+          " />
+          <button id="btnChat" class="primary" style="padding: 10px 16px;">Envoyer</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const timeline = document.getElementById('timeline');
+    const bestEl = document.getElementById('best');
+    const altLongEl = document.getElementById('altLong');
+    const clarifyEl = document.getElementById('clarify');
+    const techTermsEl = document.getElementById('techTerms');
+    const langEl = document.getElementById('lang');
+    const runningEl = document.getElementById('running');
+    const dotEl = document.getElementById('dot');
+    const errBox = document.getElementById('errBox');
+
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const btnReset = document.getElementById('btnReset');
+    const btnSpeakerMode = document.getElementById('btnSpeakerMode');
+    const btnToggleSpeaker = document.getElementById('btnToggleSpeaker');
+    const btnFR = document.getElementById('btnFR');
+    const btnEN = document.getElementById('btnEN');
+    const btnAsk = document.getElementById('btnAsk');
+    const meetingSel = document.getElementById('meetingSel');
+    const btnNewMeeting = document.getElementById('btnNewMeeting');
+    const profileSel = document.getElementById('profileSel');
+
+    // Speaker mode: 'auto' (mic=ME, loopback=OTHER) or 'manual' (user toggles)
+    let speakerMode = 'auto';
+    let currentSpeaker = 'ME';
+    
+    function updateSpeakerModeUI() {
+      if (speakerMode === 'auto') {
+        btnSpeakerMode.textContent = '🔄 Auto';
+        btnSpeakerMode.className = '';
+        btnToggleSpeaker.style.display = 'none';
+      } else {
+        btnSpeakerMode.textContent = '✋ Manuel';
+        btnSpeakerMode.className = 'warn';
+        btnToggleSpeaker.style.display = '';
+        updateSpeakerButton();
+      }
+    }
+    
+    function updateSpeakerButton() {
+      if (currentSpeaker === 'ME') {
+        btnToggleSpeaker.textContent = '🎤 ME (moi)';
+        btnToggleSpeaker.className = 'primary';
+      } else {
+        btnToggleSpeaker.textContent = '🎧 OTHER (interlocuteur)';
+        btnToggleSpeaker.className = 'warn';
+      }
+    }
+    
+    btnSpeakerMode.onclick = async () => {
+      speakerMode = speakerMode === 'auto' ? 'manual' : 'auto';
+      updateSpeakerModeUI();
+      // Notify backend of mode change
+      try {
+        await post('/api/speaker-mode', { mode: speakerMode, speaker: currentSpeaker });
+      } catch (e) {
+        console.error('Failed to update speaker mode:', e);
+      }
+    };
+    
+    btnToggleSpeaker.onclick = async () => {
+      currentSpeaker = currentSpeaker === 'ME' ? 'OTHER' : 'ME';
+      updateSpeakerButton();
+      // Notify backend of speaker change
+      try {
+        await post('/api/speaker', { speaker: currentSpeaker });
+      } catch (e) {
+        console.error('Failed to update speaker:', e);
+      }
+    };
+
+    const copyBest = document.getElementById('copyBest');
+    const copyAltLong = document.getElementById('copyAltLong');
+    const copyClarify = document.getElementById('copyClarify');
+
+    function setError(msg) {
+      if (!msg) { errBox.style.display = 'none'; errBox.textContent = ''; return; }
+      errBox.style.display = 'block';
+      errBox.textContent = msg;
+    }
+
+    let lastFinalSpeaker = null;
+    let lastFinalLine = null;
+
+    function appendLine(speaker, text, isFinal) {
+      // Remove existing interim line for that speaker
+      const interimId = `interim-${speaker}`;
+      const old = document.getElementById(interimId);
+      if (!isFinal && old) old.remove();
+
+      // For final transcripts: concatenate if same speaker as last final
+      if (isFinal && speaker === lastFinalSpeaker && lastFinalLine) {
+        const msgEl = lastFinalLine.querySelector('.msg');
+        if (msgEl) {
+          msgEl.textContent += ' ' + text;
+          timeline.scrollTop = timeline.scrollHeight;
+          return;
+        }
+      }
+
+      const row = document.createElement('div');
+      row.className = 'line';
+      if (!isFinal) row.id = interimId;
+
+      const sp = document.createElement('div');
+      sp.className = 'speaker ' + (speaker === 'ME' ? 'me' : 'other');
+      sp.textContent = speaker;
+
+      const msg = document.createElement('div');
+      msg.className = 'msg' + (isFinal ? '' : ' interim');
+      msg.textContent = text;
+
+      row.appendChild(sp);
+      row.appendChild(msg);
+      timeline.appendChild(row);
+      timeline.scrollTop = timeline.scrollHeight;
+
+      // Track last final line for concatenation
+      if (isFinal) {
+        lastFinalSpeaker = speaker;
+        lastFinalLine = row;
+      }
+    }
+
+    async function post(path, body) {
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : '{}'
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.ok === false) {
+        throw new Error(data.error || `HTTP ${r.status}`);
+      }
+      return data;
+    }
+
+    function setState({running, language}) {
+      runningEl.textContent = running ? 'online' : 'offline';
+      dotEl.className = 'statusDot ' + (running ? 'on' : 'off');
+      langEl.textContent = language || '—';
+      btnAsk.disabled = !running;
+      btnStop.disabled = !running;
+      btnStart.disabled = running;
+    }
+
+    btnStart.onclick = async () => { setError(''); await post('/api/start'); };
+    btnStop.onclick = async () => { setError(''); await post('/api/stop'); };
+    btnReset.onclick = async () => { 
+      setError(''); 
+      await post('/api/reset'); 
+      timeline.innerHTML = '';
+      lastFinalSpeaker = null;
+      lastFinalLine = null;
+      bestEl.textContent = '—';
+      altLongEl.textContent = '—';
+      clarifyEl.textContent = '—';
+      techTermsEl.textContent = '—';
+    };
+    btnFR.onclick = async () => { setError(''); await post('/api/language', {language:'fr'}); };
+    btnEN.onclick = async () => { setError(''); await post('/api/language', {language:'en'}); };
+    btnAsk.onclick = async () => { 
+      setError(''); 
+      // Show loading state
+      btnAsk.classList.add('btn-loading');
+      btnAsk.disabled = true;
+      const originalText = btnAsk.textContent;
+      btnAsk.textContent = 'Réflexion...';
+      btnAsk.style.paddingRight = '30px';
+      
+      // Show thinking animation in suggestion blocks
+      bestEl.innerHTML = '<span class="thinking">🤔 Analyse de la conversation<span class="thinking-dots"></span></span>';
+      altLongEl.innerHTML = '<span class="thinking">💭 Préparation de la réponse détaillée<span class="thinking-dots"></span></span>';
+      clarifyEl.innerHTML = '<span class="thinking">❓ Vérification des ambiguïtés<span class="thinking-dots"></span></span>';
+      techTermsEl.innerHTML = '<span class="thinking">📚 Identification des termes techniques<span class="thinking-dots"></span></span>';
+      
+      try {
+        await post('/api/ask');
+      } finally {
+        // Reset button state
+        btnAsk.classList.remove('btn-loading');
+        btnAsk.textContent = originalText;
+        btnAsk.style.paddingRight = '';
+        // Only re-enable if session is still running
+        btnAsk.disabled = !lastRunning;
+      }
+    };
+
+    async function copyText(t) {
+      try { await navigator.clipboard.writeText(t || ''); }
+      catch (e) { setError('Impossible de copier dans le presse-papier (permissions navigateur).'); }
+    }
+    copyBest.onclick = () => copyText(bestEl.textContent === '—' ? '' : bestEl.textContent);
+    copyAltLong.onclick = () => copyText(altLongEl.textContent === '—' ? '' : altLongEl.textContent);
+    copyClarify.onclick = () => copyText(clarifyEl.textContent === '—' ? '' : clarifyEl.textContent);
+
+    // Hotkey when page focused
+    window.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.altKey && e.code === 'Space') {
+        e.preventDefault();
+        btnAsk.click();
+      }
+    });
+
+    // WebSocket feed
+    const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
+
+    ws.onopen = () => setError('');
+    ws.onerror = () => setError('WebSocket: erreur de connexion. Le backend tourne bien ?');
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'state') setState(msg);
+      if (msg.type === 'transcript') {
+        appendLine(msg.speaker, msg.text, !!msg.is_final);
+      }
+      if (msg.type === 'suggestions') {
+        bestEl.textContent = msg.best || '—';
+        altLongEl.textContent = msg.alternative || '—';
+        clarifyEl.textContent = msg.clarifying_question || '—';
+        
+        // Display technical terms explanations
+        const terms = msg.technical_terms || [];
+        if (terms.length > 0) {
+          techTermsEl.innerHTML = terms.map(t => 
+            `<div style="margin-bottom: 8px;"><strong style="color: var(--other);">${t.term}</strong>: ${t.explanation}</div>`
+          ).join('');
+        } else {
+          techTermsEl.textContent = '—';
+        }
+      }
+      if (msg.type === 'reset') {
+        timeline.innerHTML = '';
+        lastFinalSpeaker = null;
+        lastFinalLine = null;
+      }
+      if (msg.type === 'error') setError(msg.message || 'Erreur inconnue.');
+    };
+
+    // ============ MICROPHONE CAPTURE (browser-side) using MediaRecorder ============
+    // Based on Deepgram's official example: https://deepgram.com/learn/live-transcription-mic-browser
+    let micStream = null;
+    let mediaRecorder = null;
+
+    async function startMicCapture() {
+      console.log('startMicCapture called');
+      try {
+        // Request microphone access - browser will show device picker
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        console.log('getUserMedia success, tracks:', micStream.getTracks().length);
+
+        // Create MediaRecorder to capture audio chunks
+        // Force WebM/Opus format for best Deepgram compatibility
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+          ? 'audio/webm;codecs=opus' 
+          : MediaRecorder.isTypeSupported('audio/webm') 
+            ? 'audio/webm' 
+            : '';
+        mediaRecorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
+        
+        let chunkCount = 0;
+        mediaRecorder.addEventListener('dataavailable', async (event) => {
+          chunkCount++;
+          if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+            // Convert Blob to base64 and send
+            const arrayBuffer = await event.data.arrayBuffer();
+            const bytes = new Uint8Array(arrayBuffer);
+            const base64 = btoa(String.fromCharCode(...bytes));
+            
+            // Capture speaker at the moment audio is sent (not when transcription comes back)
+            const speakerAtCapture = (speakerMode === 'manual') ? currentSpeaker : 'ME';
+            
+            if (chunkCount <= 5) {
+              console.log(`Sending audio chunk ${chunkCount}, size: ${event.data.size} bytes, speaker: ${speakerAtCapture}`);
+            }
+            
+            ws.send(JSON.stringify({ 
+              type: 'audio_blob', 
+              data: base64, 
+              mimeType: event.data.type || mediaRecorder.mimeType,
+              speaker: speakerAtCapture  // Send speaker with audio
+            }));
+          }
+        });
+
+        // Start recording with 250ms chunks (as recommended by Deepgram)
+        mediaRecorder.start(250);
+        console.log('MediaRecorder started, mimeType:', mediaRecorder.mimeType);
+      } catch (err) {
+        setError('Erreur micro: ' + (err.message || err));
+        console.error('Mic capture error:', err);
+      }
+    }
+
+    function stopMicCapture() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        mediaRecorder = null;
+      }
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+        micStream = null;
+      }
+      console.log('Microphone capture stopped');
+    }
+
+    // Start/stop mic when session starts/stops
+    let lastRunning = false;
+    const originalSetState = setState;
+    setState = function(s) {
+      originalSetState(s);
+      if (s.running && !lastRunning) {
+        startMicCapture();
+      } else if (!s.running && lastRunning) {
+        stopMicCapture();
+      }
+      lastRunning = s.running;
+    };
+
+    // initial optimistic state (server will send real state)
+    setState({running:false, language:'—'});
+
+    // Loopback device selector (in header)
+    const loopSel = document.getElementById('loopSel');
+
+    function optLabel(d) {
+      return `[${d.index}] ${d.name}`;
+    }
+
+    async function loadDevices() {
+      try {
+        const r = await fetch('/api/devices');
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || 'devices error');
+        const devices = data.devices || [];
+        loopSel.innerHTML = '';
+
+        // Get current loopback device from state
+        const loopbackInfo = (data.state || {}).loopback_device;
+        const loopDefault = loopbackInfo ? loopbackInfo.index : null;
+
+        if (devices.length === 0) {
+          const o = document.createElement('option');
+          o.textContent = '(aucun device loopback trouvé)';
+          o.disabled = true;
+          loopSel.appendChild(o);
+        }
+
+        for (const d of devices) {
+          const o = document.createElement('option');
+          o.value = String(d.index);
+          o.textContent = optLabel(d);
+          loopSel.appendChild(o);
+        }
+
+        if (loopDefault !== null && loopDefault !== undefined) {
+          loopSel.value = String(loopDefault);
+        }
+      } catch (e) {
+        setError('Impossible de charger la liste des devices: ' + (e.message || e));
+      }
+    }
+
+    loadDevices();
+
+    // ============ MEETINGS ============
+    let currentMeeting = null;
+
+    async function loadMeetings() {
+      try {
+        const r = await fetch('/api/meetings');
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || 'meetings error');
+        
+        const meetings = data.meetings || [];
+        currentMeeting = data.current;
+        
+        meetingSel.innerHTML = '';
+        
+        if (meetings.length === 0) {
+          const o = document.createElement('option');
+          o.value = currentMeeting || '';
+          o.textContent = currentMeeting || 'Nouveau meeting';
+          meetingSel.appendChild(o);
+        } else {
+          for (const m of meetings) {
+            const o = document.createElement('option');
+            o.value = m.id;
+            o.textContent = `${m.name} (${m.entries})`;
+            if (m.id === currentMeeting) o.selected = true;
+            meetingSel.appendChild(o);
+          }
+        }
+      } catch (e) {
+        console.error('Failed to load meetings:', e);
+      }
+    }
+
+    meetingSel.onchange = async () => {
+      const meetingId = meetingSel.value;
+      if (!meetingId || meetingId === currentMeeting) return;
+      
+      setError('');
+      try {
+        const data = await post('/api/meetings/load', { id: meetingId });
+        currentMeeting = meetingId;
+        
+        // Clear timeline
+        timeline.innerHTML = '';
+        lastFinalSpeaker = null;
+        lastFinalLine = null;
+        
+        // Load history from response
+        if (data.history && Array.isArray(data.history)) {
+          for (const entry of data.history) {
+            // For history, display each entry as-is without concatenation
+            const row = document.createElement('div');
+            row.className = 'line';
+            
+            const sp = document.createElement('div');
+            sp.className = 'speaker ' + (entry.speaker === 'ME' ? 'me' : 'other');
+            sp.textContent = entry.speaker;
+            
+            const msg = document.createElement('div');
+            msg.className = 'msg';
+            msg.textContent = entry.text;
+            
+            row.appendChild(sp);
+            row.appendChild(msg);
+            timeline.appendChild(row);
+          }
+          // Scroll to bottom to show most recent
+          timeline.scrollTop = timeline.scrollHeight;
+        }
+      } catch (e) {
+        setError('Erreur chargement meeting: ' + (e.message || e));
+        loadMeetings(); // Reload to reset selection
+      }
+    };
+
+    btnNewMeeting.onclick = async () => {
+      const name = prompt('Nom du nouveau meeting (laisser vide pour auto):');
+      if (name === null) return; // Cancelled
+      
+      setError('');
+      try {
+        await post('/api/meetings/new', { name });
+        await loadMeetings();
+        // Clear UI
+        timeline.innerHTML = '';
+        lastFinalSpeaker = null;
+        lastFinalLine = null;
+        bestEl.textContent = '—';
+        altLongEl.textContent = '—';
+        clarifyEl.textContent = '—';
+        techTermsEl.textContent = '—';
+      } catch (e) {
+        setError('Erreur création meeting: ' + (e.message || e));
+      }
+    };
+
+    // Handle meeting_changed event from WebSocket
+    const originalOnMessage = ws.onmessage;
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'meeting_changed') {
+        currentMeeting = msg.meeting;
+        loadMeetings();
+        // If history is provided, display it
+        if (msg.history && Array.isArray(msg.history)) {
+          timeline.innerHTML = '';
+          lastFinalSpeaker = null;
+          lastFinalLine = null;
+          for (const entry of msg.history) {
+            appendLine(entry.speaker, entry.text, true);
+          }
+        }
+      }
+      // Call original handler for other messages
+      originalOnMessage.call(ws, ev);
+    };
+
+    // Load meetings on startup
+    loadMeetings();
+
+    // ============ PROFILES ============
+    let currentProfile = '';
+
+    async function loadProfiles() {
+      try {
+        const r = await fetch('/api/profiles');
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || 'profiles error');
+        
+        const profiles = data.profiles || [];
+        currentProfile = data.current || '';
+        
+        // Keep the "(aucun)" option
+        profileSel.innerHTML = '<option value="">(aucun)</option>';
+        
+        for (const p of profiles) {
+          const o = document.createElement('option');
+          o.value = p.id;
+          o.textContent = p.name;
+          o.title = p.preview; // Show preview on hover
+          if (p.id === currentProfile) o.selected = true;
+          profileSel.appendChild(o);
+        }
+        
+        // Select current if set
+        if (currentProfile) {
+          profileSel.value = currentProfile;
+        }
+      } catch (e) {
+        console.error('Failed to load profiles:', e);
+      }
+    }
+
+    profileSel.onchange = async () => {
+      const profileId = profileSel.value;
+      if (profileId === currentProfile) return;
+      
+      setError('');
+      try {
+        await post('/api/profiles/select', { id: profileId });
+        currentProfile = profileId;
+      } catch (e) {
+        setError('Erreur sélection profil: ' + (e.message || e));
+        profileSel.value = currentProfile; // Revert
+      }
+    };
+
+    // Load profiles on startup
+    loadProfiles();
+
+    // ============ CHAT ============
+    const chatMessages = document.getElementById('chatMessages');
+    const chatInput = document.getElementById('chatInput');
+    const btnChat = document.getElementById('btnChat');
+
+    function addChatMessage(text, type) {
+      // Remove welcome message if present
+      const welcome = chatMessages.querySelector('.chatWelcome');
+      if (welcome) welcome.remove();
+
+      const bubble = document.createElement('div');
+      bubble.className = 'chatBubble ' + type;
+      bubble.textContent = text;
+      chatMessages.appendChild(bubble);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return bubble;
+    }
+
+    async function sendChatMessage() {
+      const question = chatInput.value.trim();
+      if (!question) return;
+
+      chatInput.value = '';
+      chatInput.disabled = true;
+      btnChat.disabled = true;
+
+      // Show user message
+      addChatMessage(question, 'user');
+
+      // Show loading
+      const loadingBubble = addChatMessage('Réflexion...', 'loading');
+
+      try {
+        const data = await post('/api/chat', { question });
+        loadingBubble.remove();
+        addChatMessage(data.response || '(pas de réponse)', 'assistant');
+      } catch (e) {
+        loadingBubble.remove();
+        addChatMessage('Erreur: ' + (e.message || e), 'assistant');
+      } finally {
+        chatInput.disabled = false;
+        btnChat.disabled = false;
+        chatInput.focus();
+      }
+    }
+
+    btnChat.onclick = sendChatMessage;
+    chatInput.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    };
+  </script>
+</body>
+</html>

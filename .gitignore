@@ -1,0 +1,25 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Configuration locale (contient les clés API)
+.env
+
+# Données personnelles (garder les .gitkeep)
+profiles/*
+!profiles/.gitkeep
+meetings/*
+!meetings/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+websockets
+PyAudioWPatch
+numpy
+scipy
+python-dotenv
+openai

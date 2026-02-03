@@ -1,0 +1,12 @@
+# Keywords pour améliorer la reconnaissance vocale Deepgram
+# Un mot ou expression par ligne
+# 
+# ATTENTION: Trop de keywords peut causer des faux positifs
+# (Deepgram reconnaît ces mots même quand tu dis autre chose)
+#
+# Ajoute seulement des mots VRAIMENT importants et peu communs.
+# Laisse vide pour une transcription normale.
+#
+# Exemples de bons keywords (peu communs, spécifiques):
+MLObs
+LLM
