@@ -42,6 +42,9 @@ class DeepgramConfig:
     is_containerized: bool = False
     # Keywords to boost recognition of specific terms
     keywords: tuple[str, ...] = ()
+    # Gap between words (ms) after which Deepgram sends an UtteranceEnd message (needs interim_results).
+    # None disables it. Deepgram recommends >= 1000 (interim results are sent about every second).
+    utterance_end_ms: Optional[int] = 1000
 
     def url(self) -> str:
         params = {
@@ -58,6 +61,8 @@ class DeepgramConfig:
             params["encoding"] = "linear16"
             params["sample_rate"] = str(self.sample_rate)
             params["channels"] = str(self.channels)
+        if self.interim_results and self.utterance_end_ms is not None:
+            params["utterance_end_ms"] = str(self.utterance_end_ms)
         qs = "&".join([f"{k}={v}" for k, v in params.items()])
         
         # Add keywords for better recognition of technical terms
@@ -115,6 +120,8 @@ async def run_deepgram(
 
     on_event receives dict containing:
       - text, is_final, ts, raw, tag
+    Deepgram `UtteranceEnd` messages are forwarded as an event with empty text and
+    `utterance_end: True` (is_final True, raw = the UtteranceEnd payload).
 
     Sends KeepAlive during audio silence. When stop_event is set, sends CloseStream and keeps
     forwarding results until the server closes or CLOSE_DEADLINE_S elapses, then returns.
@@ -188,6 +195,18 @@ async def run_deepgram(
                 try:
                     payload = json.loads(raw)
                 except (ValueError, TypeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("type") == "UtteranceEnd":
+                    await on_event(
+                        {
+                            "text": "",
+                            "is_final": True,
+                            "utterance_end": True,
+                            "ts": time.time(),
+                            "raw": payload,
+                            "tag": tag,
+                        }
+                    )
                     continue
                 text, is_final = _extract_transcript(payload)
                 if not text:

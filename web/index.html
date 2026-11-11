@@ -115,9 +115,31 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 6px 8px;
+      flex-wrap: wrap;
       border-bottom: 1px solid var(--border);
       background: rgba(255,255,255,.03);
     }
+    .cardHeaderRight {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .autoBadge {
+      color: var(--warn);
+      border-color: rgba(255,204,102,.40);
+    }
+    #detectedQuestion {
+      font-style: italic;
+      word-break: break-word;
+    }
+    #keyPoints ul {
+      margin: 0;
+      padding-left: 18px;
+      white-space: normal;
+    }
+    #keyPoints li { margin: 2px 0; }
     .cardHeader strong { font-size: 13px; letter-spacing: .2px; }
     .controls {
       display: flex;
@@ -177,6 +199,15 @@
       word-break: break-word;
     }
     .msg.interim, .msg span.interim { color: rgba(255,255,255,.62); font-style: italic; }
+    /* Transcription size: normal (default) | compact | mini — frees room for the suggestions */
+    main.ts-compact { grid-template-columns: minmax(0, 0.75fr) minmax(0, 1.25fr); }
+    main.ts-mini { grid-template-columns: minmax(0, 0.5fr) minmax(0, 1.5fr); }
+    main.ts-compact .line { grid-template-columns: 56px 1fr; gap: 8px; padding: 6px 0; }
+    main.ts-compact .msg { font-size: 13px; }
+    main.ts-mini .line { grid-template-columns: 44px 1fr; gap: 6px; padding: 4px 0; }
+    main.ts-mini .speaker { font-size: 11px; }
+    main.ts-mini .msg { font-size: 12px; line-height: 1.3; }
+    main.ts-mini #timeline { height: 45vh; padding: 8px 10px 10px; }
     .small {
       font-size: 12px;
       color: var(--muted);
@@ -285,8 +316,10 @@
       }
     }
     @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; }
+      main, main.ts-compact, main.ts-mini { grid-template-columns: minmax(0, 1fr); }
       #timeline { height: 50vh; }
+      main.ts-compact #timeline { height: 35vh; }
+      main.ts-mini #timeline { height: 22vh; }
       .pill { font-size: 10px; padding: 2px 6px; }
       button { font-size: 12px; padding: 6px 8px; }
     }
@@ -349,18 +382,23 @@
           <option value="">Chargement...</option>
         </select>
       </span>
-      <span class="pill">Langue: <strong id="lang">—</strong></span>
-      <span class="pill">Hotkey: <span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">Space</span></span>
+      <span class="pill">
+        Langue:
+        <select id="langSel" title="Langue de la transcription et des réponses">
+          <option value="fr">Français</option>
+          <option value="en">English</option>
+        </select>
+      </span>
+      <span class="pill" id="hotkeyLabel"></span>
     </div>
     <div class="controls">
       <button class="good" id="btnStart">Start</button>
       <button class="danger" id="btnStop">Stop</button>
       <button id="btnReset">Reset</button>
-      <button id="btnSpeakerMode" style="min-width: 80px;">🔄 Auto</button>
+      <button id="btnSpeakerMode" style="min-width: 80px;" title="Micro = ME, son du PC = OTHER">🔄 Source auto</button>
       <button id="btnToggleSpeaker" class="primary" style="min-width: 140px; display: none;">🎤 ME (moi)</button>
-      <button class="primary" id="btnFR">FR</button>
-      <button class="primary" id="btnEN">EN</button>
       <button class="warn" id="btnAsk">Proposer une réponse</button>
+      <button id="btnAutoAnswer" title="Génère automatiquement une réponse quand l'interlocuteur pose une question">⚡ Réponse auto : OFF</button>
     </div>
   </header>
 
@@ -368,7 +406,10 @@
     <section class="card">
       <div class="cardHeader">
         <strong>Timeline</strong>
-        <span class="small">ME = micro | OTHER = loopback</span>
+        <span class="cardHeaderRight">
+          <span class="small">ME = micro | OTHER = loopback</span>
+          <button id="btnTimelineSize" class="pill-btn" style="font-size: 11px; padding: 2px 8px;">Réduire</button>
+        </span>
       </div>
       <div id="timeline"></div>
       <div class="error" id="errBox"></div>
@@ -378,14 +419,25 @@
       <section class="card">
         <div class="cardHeader">
           <strong>Suggestions</strong>
-          <span class="small">Copie rapide</span>
+          <span class="cardHeaderRight">
+            <span class="pill autoBadge" id="autoBadge" style="display: none;" title="Suggestion générée automatiquement (question détectée)">⚡ auto</span>
+            <span class="small">Copie rapide</span>
+          </span>
         </div>
         <div id="suggestions">
+          <div class="small" id="detectedQuestion" style="display: none;"></div>
           <div class="suggestBlock">
             <h3>Meilleure réponse (concise)</h3>
             <div class="suggestText" id="best">—</div>
             <div class="row">
               <button id="copyBest">Copier</button>
+            </div>
+          </div>
+          <div class="suggestBlock">
+            <h3>🔑 Points clés</h3>
+            <div class="suggestText" id="keyPoints">—</div>
+            <div class="row">
+              <button id="copyKeyPoints">Copier</button>
             </div>
           </div>
           <div class="suggestBlock">
@@ -452,7 +504,14 @@
     const altLongEl = document.getElementById('altLong');
     const clarifyEl = document.getElementById('clarify');
     const techTermsEl = document.getElementById('techTerms');
-    const langEl = document.getElementById('lang');
+    const keyPointsEl = document.getElementById('keyPoints');
+    const detectedQuestionEl = document.getElementById('detectedQuestion');
+    const autoBadgeEl = document.getElementById('autoBadge');
+    const mainEl = document.querySelector('main');
+    const btnTimelineSize = document.getElementById('btnTimelineSize');
+    const btnAutoAnswer = document.getElementById('btnAutoAnswer');
+    const langSel = document.getElementById('langSel');
+    let currentLanguage = langSel.value; // last language confirmed by the server
     const runningEl = document.getElementById('running');
     const dotEl = document.getElementById('dot');
     const errBox = document.getElementById('errBox');
@@ -462,8 +521,6 @@
     const btnReset = document.getElementById('btnReset');
     const btnSpeakerMode = document.getElementById('btnSpeakerMode');
     const btnToggleSpeaker = document.getElementById('btnToggleSpeaker');
-    const btnFR = document.getElementById('btnFR');
-    const btnEN = document.getElementById('btnEN');
     const btnAsk = document.getElementById('btnAsk');
     const meetingSel = document.getElementById('meetingSel');
     const btnNewMeeting = document.getElementById('btnNewMeeting');
@@ -477,11 +534,13 @@
 
     function updateSpeakerModeUI() {
       if (speakerMode === 'auto') {
-        btnSpeakerMode.textContent = '🔄 Auto';
+        btnSpeakerMode.textContent = '🔄 Source auto';
+        btnSpeakerMode.title = 'Micro = ME, son du PC = OTHER';
         btnSpeakerMode.className = '';
         btnToggleSpeaker.style.display = 'none';
       } else {
         btnSpeakerMode.textContent = '✋ Manuel';
+        btnSpeakerMode.title = 'Tu indiques toi-même qui parle (ME / OTHER)';
         btnSpeakerMode.className = 'warn';
         btnToggleSpeaker.style.display = '';
         updateSpeakerButton();
@@ -598,7 +657,10 @@
     function setState({running, language}) {
       runningEl.textContent = running ? 'online' : 'offline';
       dotEl.className = 'statusDot ' + (running ? 'on' : 'off');
-      langEl.textContent = language || '—';
+      if (language === 'fr' || language === 'en') {
+        currentLanguage = language;
+        langSel.value = language;
+      }
       btnAsk.disabled = !running;
       btnStop.disabled = !running;
       btnStart.disabled = running;
@@ -626,42 +688,171 @@
         setError('Erreur reset: ' + errText(e));
         return;
       }
-      pendingAsk = null;
       timeline.innerHTML = '';
       lastFinalSpeaker = null;
       lastFinalLine = null;
-      bestEl.textContent = '—';
-      altLongEl.textContent = '—';
-      clarifyEl.textContent = '—';
-      techTermsEl.textContent = '—';
+      clearSuggestions();
     };
-    btnFR.onclick = async () => {
+    // Language dropdown: the server is the source of truth (state messages set langSel.value)
+    langSel.onchange = async () => {
+      const wanted = langSel.value;
+      if (wanted === currentLanguage) return;
       setError('');
-      try { await post('/api/language', {language:'fr'}); }
-      catch (e) { setError('Erreur changement de langue: ' + errText(e)); }
-    };
-    btnEN.onclick = async () => {
-      setError('');
-      try { await post('/api/language', {language:'en'}); }
-      catch (e) { setError('Erreur changement de langue: ' + errText(e)); }
+      langSel.disabled = true;
+      try {
+        await post('/api/language', { language: wanted });
+        currentLanguage = wanted;
+      } catch (e) {
+        langSel.value = currentLanguage; // revert
+        setError('Erreur changement de langue: ' + errText(e));
+      } finally {
+        langSel.disabled = false;
+      }
     };
 
     // Snapshot of the suggestion blocks taken before showing the "thinking" placeholders.
     // Non-null only while placeholders are displayed.
     let pendingAsk = null;
 
+    function setNodesOrDash(el, nodes) {
+      if (nodes.length > 0) {
+        el.replaceChildren(...nodes);
+      } else {
+        el.textContent = '—';
+      }
+    }
+
+    function setDetectedQuestion(question) {
+      const q = String(question ?? '').trim();
+      detectedQuestionEl.textContent = q ? 'Question détectée : ' + q : '';
+      detectedQuestionEl.style.display = q ? '' : 'none';
+    }
+
+    function setAutoBadge(visible) {
+      autoBadgeEl.style.display = visible ? '' : 'none';
+    }
+
+    // Show the "thinking" placeholders (manual ask or auto-answer). The previous content is
+    // snapshotted only once: an ask arriving while placeholders are shown must not snapshot them.
+    function beginPendingSuggestions(question) {
+      if (pendingAsk && pendingAsk.partial) {
+        // New ask while the previous one only delivered its partial: that partial content
+        // (best, key points, question, badge) becomes what an error must restore.
+        pendingAsk.best = bestEl.textContent;
+        pendingAsk.keyPoints = Array.from(keyPointsEl.childNodes);
+        pendingAsk.question = detectedQuestionEl.style.display === 'none' ? '' : detectedQuestionEl.textContent;
+        pendingAsk.autoBadge = autoBadgeEl.style.display !== 'none';
+        pendingAsk.partial = false;
+        pendingAsk.partialAuto = undefined;
+      }
+      if (!pendingAsk) {
+        pendingAsk = {
+          best: bestEl.textContent,
+          keyPoints: Array.from(keyPointsEl.childNodes),
+          altLong: altLongEl.textContent,
+          clarify: clarifyEl.textContent,
+          techTerms: Array.from(techTermsEl.childNodes),
+          question: detectedQuestionEl.style.display === 'none' ? '' : detectedQuestionEl.textContent,
+          autoBadge: autoBadgeEl.style.display !== 'none'
+        };
+      }
+      // Static markup only (no dynamic content)
+      bestEl.innerHTML = '<span class="thinking">🤔 Analyse de la conversation<span class="thinking-dots"></span></span>';
+      keyPointsEl.innerHTML = '<span class="thinking">🔑 Extraction des points clés<span class="thinking-dots"></span></span>';
+      altLongEl.innerHTML = '<span class="thinking">💭 Préparation de la réponse détaillée<span class="thinking-dots"></span></span>';
+      clarifyEl.innerHTML = '<span class="thinking">❓ Vérification des ambiguïtés<span class="thinking-dots"></span></span>';
+      techTermsEl.innerHTML = '<span class="thinking">📚 Identification des termes techniques<span class="thinking-dots"></span></span>';
+      setDetectedQuestion(question);
+      setAutoBadge(false);
+    }
+
     function restoreSuggestions() {
       if (!pendingAsk) return;
       const snap = pendingAsk;
       pendingAsk = null;
-      bestEl.textContent = snap.best || '—';
       altLongEl.textContent = snap.altLong || '—';
       clarifyEl.textContent = snap.clarify || '—';
-      if (snap.techTerms.length > 0) {
-        techTermsEl.replaceChildren(...snap.techTerms);
+      setNodesOrDash(techTermsEl, snap.techTerms);
+      // Partial already received: best, key points, question and badge belong to the new answer
+      if (snap.partial) return;
+      bestEl.textContent = snap.best || '—';
+      setNodesOrDash(keyPointsEl, snap.keyPoints);
+      // snap.question already carries the "Question détectée : " prefix
+      detectedQuestionEl.textContent = snap.question;
+      detectedQuestionEl.style.display = snap.question ? '' : 'none';
+      setAutoBadge(snap.autoBadge);
+    }
+
+    function clearSuggestions() {
+      pendingAsk = null;
+      bestEl.textContent = '—';
+      keyPointsEl.textContent = '—';
+      altLongEl.textContent = '—';
+      clarifyEl.textContent = '—';
+      techTermsEl.textContent = '—';
+      setDetectedQuestion('');
+      setAutoBadge(false);
+    }
+
+    // DOM built with textContent only: LLM output is untrusted
+    function renderBestAndKeyPoints(msg) {
+      bestEl.textContent = msg.best || '—';
+      const points = Array.isArray(msg.key_points)
+        ? msg.key_points.map(p => String(p ?? '').trim()).filter(Boolean)
+        : [];
+      if (points.length > 0) {
+        const ul = document.createElement('ul');
+        for (const p of points) {
+          const li = document.createElement('li');
+          li.textContent = p;
+          ul.appendChild(li);
+        }
+        keyPointsEl.replaceChildren(ul);
       } else {
-        techTermsEl.textContent = '—';
+        keyPointsEl.textContent = '—';
       }
+    }
+
+    // Fills the auto badge and drops the detected question for manual answers
+    function setSuggestionsOrigin(isAuto) {
+      setAutoBadge(isAuto);
+      // Keep the detected question visible for auto answers (it is what was answered)
+      if (!isAuto) setDetectedQuestion('');
+    }
+
+    // First, fast part of the answer: the request is not over (the other 3 blocks keep their
+    // placeholders and stay restorable by a later 'error')
+    function renderPartialSuggestions(msg) {
+      if (!pendingAsk) beginPendingSuggestions(null);
+      if (!pendingAsk.partial) {
+        pendingAsk.partial = true;
+        pendingAsk.partialAuto = msg.auto === true; // the badge follows the first message received
+      }
+      renderBestAndKeyPoints(msg);
+      setSuggestionsOrigin(pendingAsk.partialAuto);
+      endAskLoading();
+    }
+
+    function renderSuggestions(msg) {
+      const isAuto = (pendingAsk && pendingAsk.partial) ? pendingAsk.partialAuto : msg.auto === true;
+      pendingAsk = null; // fresh suggestions: never restore the old snapshot over them
+      renderBestAndKeyPoints(msg);
+      altLongEl.textContent = msg.alternative || '—';
+      clarifyEl.textContent = msg.clarifying_question || '—';
+
+      const terms = Array.isArray(msg.technical_terms) ? msg.technical_terms : [];
+      setNodesOrDash(techTermsEl, terms.map(t => {
+        const row = document.createElement('div');
+        row.style.marginBottom = '8px';
+        const strong = document.createElement('strong');
+        strong.style.color = 'var(--other)';
+        strong.textContent = String(t?.term ?? '');
+        row.appendChild(strong);
+        row.appendChild(document.createTextNode(': ' + String(t?.explanation ?? '')));
+        return row;
+      }));
+
+      setSuggestionsOrigin(isAuto);
     }
 
     function askErrorMessage(e) {
@@ -671,29 +862,28 @@
       return raw;
     }
 
+    const ASK_BUTTON_TEXT = btnAsk.textContent;
+
+    // Idempotent: called on the first partial suggestions and again when the request ends
+    function endAskLoading() {
+      btnAsk.classList.remove('btn-loading');
+      btnAsk.textContent = ASK_BUTTON_TEXT;
+      btnAsk.style.paddingRight = '';
+      // Only re-enable if session is still running
+      btnAsk.disabled = !lastRunning;
+    }
+
     btnAsk.onclick = async () => {
       setError('');
       // Show loading state
       btnAsk.classList.add('btn-loading');
       btnAsk.disabled = true;
-      const originalText = btnAsk.textContent;
       btnAsk.textContent = 'Réflexion...';
       btnAsk.style.paddingRight = '30px';
-      
-      // Snapshot current suggestions so they can be restored on failure
-      pendingAsk = {
-        best: bestEl.textContent,
-        altLong: altLongEl.textContent,
-        clarify: clarifyEl.textContent,
-        techTerms: Array.from(techTermsEl.childNodes)
-      };
 
-      // Show thinking animation in suggestion blocks
-      bestEl.innerHTML = '<span class="thinking">🤔 Analyse de la conversation<span class="thinking-dots"></span></span>';
-      altLongEl.innerHTML = '<span class="thinking">💭 Préparation de la réponse détaillée<span class="thinking-dots"></span></span>';
-      clarifyEl.innerHTML = '<span class="thinking">❓ Vérification des ambiguïtés<span class="thinking-dots"></span></span>';
-      techTermsEl.innerHTML = '<span class="thinking">📚 Identification des termes techniques<span class="thinking-dots"></span></span>';
-      
+      // Snapshot current suggestions (restored on failure) and show the thinking placeholders
+      beginPendingSuggestions(null);
+
       try {
         await post('/api/ask');
       } catch (e) {
@@ -702,12 +892,7 @@
         restoreSuggestions();
         if (!alreadyHandled) setError(askErrorMessage(e));
       } finally {
-        // Reset button state
-        btnAsk.classList.remove('btn-loading');
-        btnAsk.textContent = originalText;
-        btnAsk.style.paddingRight = '';
-        // Only re-enable if session is still running
-        btnAsk.disabled = !lastRunning;
+        endAskLoading();
       }
     };
 
@@ -718,10 +903,85 @@
     copyBest.onclick = () => copyText(bestEl.textContent === '—' ? '' : bestEl.textContent);
     copyAltLong.onclick = () => copyText(altLongEl.textContent === '—' ? '' : altLongEl.textContent);
     copyClarify.onclick = () => copyText(clarifyEl.textContent === '—' ? '' : clarifyEl.textContent);
+    document.getElementById('copyKeyPoints').onclick = () =>
+      copyText(Array.from(keyPointsEl.querySelectorAll('li'), li => li.textContent).join('\n'));
+
+    // ============ TRANSCRIPTION SIZE (normal | compact | mini) ============
+    const TIMELINE_SIZES = ['normal', 'compact', 'mini'];
+    const TIMELINE_SIZE_KEY = 'meetingCopilot.timelineSize';
+    const TIMELINE_SIZE_LABELS = {
+      normal: { text: 'Réduire', title: 'Taille de la transcription : normale (cliquer pour réduire)' },
+      compact: { text: 'Réduire', title: 'Taille de la transcription : compacte (cliquer pour réduire encore)' },
+      mini: { text: 'Agrandir', title: 'Taille de la transcription : mini (cliquer pour revenir à la taille normale)' }
+    };
+    let timelineSize = 'normal';
+
+    function applyTimelineSize(size) {
+      timelineSize = TIMELINE_SIZES.includes(size) ? size : 'normal';
+      mainEl.classList.remove('ts-compact', 'ts-mini');
+      if (timelineSize !== 'normal') mainEl.classList.add('ts-' + timelineSize);
+      btnTimelineSize.textContent = TIMELINE_SIZE_LABELS[timelineSize].text;
+      btnTimelineSize.title = TIMELINE_SIZE_LABELS[timelineSize].title;
+      // Keep the latest lines visible after the resize
+      timeline.scrollTop = timeline.scrollHeight;
+    }
+
+    btnTimelineSize.onclick = () => {
+      const next = TIMELINE_SIZES[(TIMELINE_SIZES.indexOf(timelineSize) + 1) % TIMELINE_SIZES.length];
+      applyTimelineSize(next);
+      try { localStorage.setItem(TIMELINE_SIZE_KEY, next); } catch (e) { /* storage unavailable: not persisted */ }
+    };
+
+    (function initTimelineSize() {
+      let saved = null;
+      try { saved = localStorage.getItem(TIMELINE_SIZE_KEY); } catch (e) { saved = null; }
+      applyTimelineSize(saved);
+    })();
+
+    // ============ AUTO-ANSWER ============
+    let autoAnswer = false;
+
+    function setAutoAnswerUI(enabled) {
+      autoAnswer = !!enabled;
+      btnAutoAnswer.textContent = '⚡ Réponse auto : ' + (autoAnswer ? 'ON' : 'OFF');
+      btnAutoAnswer.className = autoAnswer ? 'good' : '';
+    }
+
+    btnAutoAnswer.onclick = async () => {
+      setError('');
+      try {
+        const data = await post('/api/auto-answer', { enabled: !autoAnswer });
+        if (typeof data.enabled === 'boolean') setAutoAnswerUI(data.enabled);
+      } catch (e) {
+        setError('Erreur réponse auto : ' + errText(e));
+      }
+    };
+
+    setAutoAnswerUI(false);
+
+    // ============ ASK HOTKEY (single source: match + header label) ============
+    const ASK_HOTKEY_KEYS = ['Ctrl', 'Shift', 'Space'];
+
+    function isAskHotkey(e) {
+      return e.ctrlKey && e.shiftKey && !e.altKey && e.code === 'Space';
+    }
+
+    (function renderHotkeyLabel() {
+      const el = document.getElementById('hotkeyLabel');
+      const nodes = [document.createTextNode('Hotkey: ')];
+      ASK_HOTKEY_KEYS.forEach((k, i) => {
+        if (i > 0) nodes.push(document.createTextNode(' + '));
+        const kbd = document.createElement('span');
+        kbd.className = 'kbd';
+        kbd.textContent = k;
+        nodes.push(kbd);
+      });
+      el.replaceChildren(...nodes);
+    })();
 
     // Hotkey when page focused
     window.addEventListener('keydown', (e) => {
-      if (e.ctrlKey && e.altKey && e.code === 'Space') {
+      if (isAskHotkey(e)) {
         e.preventDefault();
         btnAsk.click();
       }
@@ -735,41 +995,26 @@
     ws.onerror = () => setError('WebSocket: erreur de connexion. Le backend tourne bien ?');
     // No auto-reconnect: on close, stop capturing (otherwise chunks pile up in micOutQueue forever)
     ws.onclose = () => {
-      setState({ running: false, language: langEl.textContent });
+      setState({ running: false, language: langSel.value });
       stopMicCapture();
       micOutQueue.length = 0;
       setError('Connexion au serveur perdue. Recharge la page une fois le serveur relancé.');
     };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'state') setState(msg);
+      if (msg.type === 'state') {
+        setState(msg);
+        // Synced here (not in setState): ws.onclose calls setState without auto_answer.
+        // Missing field (old backend / partial payload) keeps the current value (initially OFF).
+        if (typeof msg.auto_answer === 'boolean') setAutoAnswerUI(msg.auto_answer);
+      }
+      if (msg.type === 'auto_answer_changed') setAutoAnswerUI(msg.enabled === true);
       if (msg.type === 'transcript') {
         appendLine(msg.speaker, msg.text, !!msg.is_final);
       }
-      if (msg.type === 'suggestions') {
-        pendingAsk = null; // fresh suggestions: never restore the old snapshot over them
-        bestEl.textContent = msg.best || '—';
-        altLongEl.textContent = msg.alternative || '—';
-        clarifyEl.textContent = msg.clarifying_question || '—';
-
-        // Display technical terms explanations (DOM built with textContent: LLM output is untrusted)
-        const terms = msg.technical_terms || [];
-        if (terms.length > 0) {
-          const nodes = terms.map(t => {
-            const row = document.createElement('div');
-            row.style.marginBottom = '8px';
-            const strong = document.createElement('strong');
-            strong.style.color = 'var(--other)';
-            strong.textContent = String(t.term ?? '');
-            row.appendChild(strong);
-            row.appendChild(document.createTextNode(': ' + String(t.explanation ?? '')));
-            return row;
-          });
-          techTermsEl.replaceChildren(...nodes);
-        } else {
-          techTermsEl.textContent = '—';
-        }
-      }
+      if (msg.type === 'suggestions_pending') beginPendingSuggestions(msg.question);
+      if (msg.type === 'suggestions_partial') renderPartialSuggestions(msg);
+      if (msg.type === 'suggestions') renderSuggestions(msg);
       if (msg.type === 'reset') {
         timeline.innerHTML = '';
         lastFinalSpeaker = null;
@@ -915,6 +1160,12 @@
         stopMicCapture();
       }
       lastRunning = s.running;
+      if (!s.running && pendingAsk) {
+        // Session stopped mid-generation: the backend cancels it and sends neither
+        // 'suggestions' nor 'error'. Drop the placeholders (a received partial is kept).
+        restoreSuggestions();
+        endAskLoading();
+      }
     };
 
     // initial optimistic state (server will send real state)
@@ -1047,14 +1298,10 @@
         await post('/api/meetings/new', { name });
         await loadMeetings();
         // Clear UI
-        pendingAsk = null;
         timeline.innerHTML = '';
         lastFinalSpeaker = null;
         lastFinalLine = null;
-        bestEl.textContent = '—';
-        altLongEl.textContent = '—';
-        clarifyEl.textContent = '—';
-        techTermsEl.textContent = '—';
+        clearSuggestions();
       } catch (e) {
         setError('Erreur création meeting: ' + (e.message || e));
       }

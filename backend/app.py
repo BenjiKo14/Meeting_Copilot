@@ -6,8 +6,10 @@ import binascii
 import itertools
 import json
 import os
+import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +22,13 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.deepgram_stream import DeepgramConfig, run_deepgram
-from backend.gemini_suggest import generate_suggestions, generate_chat_response
+from backend.gemini_suggest import (
+    classify_question,
+    combine_suggestions,
+    generate_chat_response,
+    generate_detailed_suggestions,
+    generate_quick_suggestions,
+)
 
 
 load_dotenv()
@@ -47,6 +55,76 @@ ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "[::1]"})
 
 # stream_id used for mic chunks sent by clients that don't provide one
 LEGACY_STREAM_ID = "legacy"
+
+# Auto-answer: number of recent transcript lines given to the question classifier
+AUTO_CONTEXT_LINES = 15
+# Auto-answer prefilter: an utterance needs at least this many words to be evaluated
+AUTO_MIN_WORDS = 3
+
+# Prefilter cues, matched on accent-stripped lowercase text with hyphens turned into spaces.
+# "Anywhere" cues are (almost) always interrogative/request forms; "clause start" cues are
+# ambiguous words (relative pronouns, conjunctions) that only count at the start of a sentence.
+_CUES_ANYWHERE = {
+    "fr": (
+        "comment", "pourquoi", "quel", "quelle", "quels", "quelles", "lequel", "laquelle",
+        "lesquels", "lesquelles", "qu'est ce", "est ce", "combien", "pouvez vous", "pourriez vous",
+        "peux tu", "pourrais tu", "parlez moi", "parle moi", "racontez", "raconte moi", "expliquez",
+        "explique moi", "decrivez", "decris moi", "presentez vous", "presente toi", "donnez moi",
+        "donne moi", "dites moi", "dis moi", "avez vous", "as tu", "etes vous", "es tu",
+        "savez vous", "connaissez vous", "voulez vous", "auriez vous", "pensez vous", "selon vous",
+        "a votre avis",
+    ),
+    "en": (
+        "how", "why", "what", "can you", "could you", "would you", "will you", "do you", "did you",
+        "have you", "are you", "were you", "tell me", "tell us", "walk me through", "talk me through",
+        "describe", "explain", "give me an example", "give me", "your thoughts",
+    ),
+}
+_CUES_CLAUSE_START = {
+    "fr": ("qui", "quand", "que"),
+    "en": ("who", "where", "when", "which"),
+}
+# Fillers allowed between the start of a sentence and a clause-start cue ("Ok, et quand...")
+_CLAUSE_FILLERS = r"(?:(?:ok|okay|bon|alors|et|mais|donc|so|and|but|well|right)[\s,]+)*"
+_CLAUSE_START = r"(?:^|[.!?;:]\s*)" + _CLAUSE_FILLERS
+
+
+def _cue_regex(lang: str) -> re.Pattern[str]:
+    anywhere = "|".join(re.escape(c) for c in _CUES_ANYWHERE[lang])
+    start = "|".join(re.escape(c) for c in _CUES_CLAUSE_START[lang])
+    return re.compile(rf"(?<![\w'])(?:{anywhere})(?!\w)|{_CLAUSE_START}(?:{start})(?!\w)")
+
+
+_CUE_REGEX = {lang: _cue_regex(lang) for lang in _CUES_ANYWHERE}
+# "où" becomes "ou" ("or") once accents are stripped: matched on the accented text instead
+_FR_OU_REGEX = re.compile(_CLAUSE_START + r"où(?!\w)")
+
+
+def _fold_for_cues(text: str) -> str:
+    """Lowercase, strip accents, unify apostrophes and turn hyphens into spaces."""
+    folded = unicodedata.normalize("NFD", text.lower().replace("’", "'").replace("‘", "'"))
+    folded = "".join(c for c in folded if not unicodedata.combining(c)).replace("-", " ")
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def looks_like_question(text: str, lang: str) -> bool:
+    """Cheap prefilter of the auto-answer mode: could this utterance be a question/request to ME?
+
+    True when the text has at least AUTO_MIN_WORDS words and contains '?' or an interrogative /
+    request cue of the language (accent and case insensitive). The LLM confirms afterwards.
+    """
+    if len(re.findall(r"\w+(?:['’-]\w+)*", text)) < AUTO_MIN_WORDS:
+        return False
+    if "?" in text:
+        return True
+    lang = lang if lang in _CUE_REGEX else "fr"
+    if _CUE_REGEX[lang].search(_fold_for_cues(text)):
+        return True
+    return lang == "fr" and bool(_FR_OU_REGEX.search(text.lower().strip()))
+
+
+def _env_flag(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in ("true", "1", "yes")
 
 # Module-level keywords cache — loaded once at first session start
 _keywords_cache: Optional[tuple[str, ...]] = None
@@ -265,6 +343,18 @@ class RunningSession:
     mic_stream_start: float = field(default_factory=time.time)
     supervisor: Optional[asyncio.Task[Any]] = None
     speaker_history: list = field(default_factory=list)
+    # Auto-answer: final OTHER texts of the current utterance, and the stream tags they came from
+    other_buffer: list[str] = field(default_factory=list)
+    other_tags: set[str] = field(default_factory=set)
+    # Auto-answer: latest candidate utterance waiting for the worker (only the latest is kept)
+    auto_pending: Optional[str] = None
+    auto_task: Optional[asyncio.Task[Any]] = None
+
+    def reset_auto(self) -> None:
+        """Drop the buffered OTHER utterance and the pending auto-answer candidate."""
+        self.other_buffer.clear()
+        self.other_tags.clear()
+        self.auto_pending = None
 
     def start_mic_stream(self, stream_id: str) -> None:
         """Take over the mic: retire the current stream and open a fresh Deepgram connection.
@@ -335,6 +425,8 @@ class AppState:
         self.current_profile: str = _get_default_profile()
         self.speaker_mode: str = "auto"  # 'auto' or 'manual'
         self.current_mic_speaker: str = "ME"
+        # Auto-answer mode: generate suggestions when OTHER asks ME a question
+        self.auto_answer: bool = _env_flag("AUTO_ANSWER")
         self.history: list[dict[str, Any]] = []
         self.session: Optional[RunningSession] = None
         # Mic stream ids already used: late chunks from a previous capture (old tab,
@@ -388,8 +480,18 @@ async def broadcast(msg: dict[str, Any]) -> None:
         STATE.clients.discard(ws)
 
 
+def _state_msg(**extra: Any) -> dict[str, Any]:
+    return {
+        "type": "state",
+        "running": STATE.running,
+        "language": STATE.language,
+        "auto_answer": STATE.auto_answer,
+        **extra,
+    }
+
+
 async def push_state() -> None:
-    await broadcast({"type": "state", "running": STATE.running, "language": STATE.language})
+    await broadcast(_state_msg())
 
 
 def get_default_wasapi_loopback_device(p: pyaudio.PyAudio) -> dict[str, Any]:
@@ -525,6 +627,7 @@ async def start_session() -> None:
         else:
             speaker = STATE.current_mic_speaker
         await handle_transcript(speaker=speaker, ev=ev)
+        _auto_observe(sess, speaker, ev)
 
     async def on_loop(ev: dict[str, Any]) -> None:
         if STATE.speaker_mode == "auto":
@@ -532,6 +635,7 @@ async def start_session() -> None:
         else:
             speaker = STATE.current_mic_speaker
         await handle_transcript(speaker=speaker, ev=ev)
+        _auto_observe(sess, speaker, ev)
 
     keywords = _load_keywords()
 
@@ -572,7 +676,7 @@ async def start_session() -> None:
     ))
 
     STATE.session = sess
-    await broadcast({"type": "state", "running": True, "language": STATE.language, **meta})
+    await broadcast(_state_msg(running=True, **meta))
 
     sess.supervisor = asyncio.create_task(_supervise(sess), name="supervise")
 
@@ -591,6 +695,10 @@ async def _stop_locked() -> None:
 
     # Graceful stop: run_deepgram sends CloseStream and drains final transcripts on stop_event
     sess.stop_event.set()
+    # Auto-answer: drop the pending candidate and abandon an in-flight classify/generate
+    sess.reset_auto()
+    if sess.auto_task is not None:
+        sess.auto_task.cancel()
     tasks = list(sess.tasks)
     if tasks:
         _, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
@@ -638,6 +746,130 @@ async def handle_transcript(*, speaker: str, ev: dict[str, Any]) -> None:
         STATE._buffer_append(speaker, text, ts)
 
 
+async def _suggest_and_broadcast(*, lang: str, transcript: str, profile: str, auto: bool) -> Optional[str]:
+    """Generate suggestions with Gemini and broadcast them (manual and auto paths).
+
+    Two parallel calls: the quick one (best + key points) is broadcast as `suggestions_partial`
+    as soon as it answers; the full `suggestions` message follows once both are done, with the
+    fields of a failed call left empty. Returns an error message (also broadcast as an `error`
+    message) only if both calls fail, else None.
+    """
+    kwargs = {"lang": lang, "transcript": transcript, "profile": profile}
+
+    async def quick() -> Any:
+        part = await asyncio.to_thread(generate_quick_suggestions, **kwargs)
+        await broadcast({
+            "type": "suggestions_partial",
+            "best": part.best,
+            "key_points": part.key_points,
+            "auto": auto,
+        })
+        return part
+
+    quick_res, details_res = await asyncio.gather(
+        quick(), asyncio.to_thread(generate_detailed_suggestions, **kwargs), return_exceptions=True
+    )
+    if isinstance(quick_res, BaseException) and isinstance(details_res, BaseException):
+        await broadcast({"type": "error", "message": f"Erreur Gemini: {quick_res}"})
+        return str(quick_res)
+    for name, res in (("quick", quick_res), ("details", details_res)):
+        if isinstance(res, BaseException):
+            print(f"[suggestions] {name} call failed: {res!r}")
+    sugg = combine_suggestions(
+        None if isinstance(quick_res, BaseException) else quick_res,
+        None if isinstance(details_res, BaseException) else details_res,
+    )
+    await broadcast({
+        "type": "suggestions",
+        "language": lang,
+        "best": sugg.best,
+        "alternative": sugg.alternative,
+        "clarifying_question": sugg.clarifying_question,
+        "technical_terms": sugg.technical_terms,
+        "key_points": sugg.key_points,
+        "auto": auto,
+    })
+    return None
+
+
+def _auto_active(sess: RunningSession) -> bool:
+    return STATE.auto_answer and STATE.session is sess and not sess.stop_event.is_set()
+
+
+def _auto_observe(sess: RunningSession, speaker: str, ev: dict[str, Any]) -> None:
+    """Auto-answer trigger, fed with every Deepgram event of the session (after handle_transcript).
+
+    Accumulates OTHER final texts; the utterance is evaluated on a final with `speech_final`
+    or on an UtteranceEnd of a stream that produced OTHER text. Synchronous on purpose: it
+    never delays transcript handling (the evaluation runs in the session's worker task).
+    """
+    if not _auto_active(sess):
+        sess.reset_auto()  # don't accumulate while off: enabling later must not fire stale text
+        return
+    tag = str(ev.get("tag") or "")
+    if ev.get("utterance_end"):
+        if tag in sess.other_tags:
+            _flush_other_utterance(sess)
+        return
+    text = str(ev.get("text") or "").strip()
+    if speaker != "OTHER" or not ev.get("is_final") or not text:
+        return
+    sess.other_buffer.append(text)
+    sess.other_tags.add(tag)
+    raw = ev.get("raw")
+    if isinstance(raw, dict) and raw.get("speech_final") is True:
+        _flush_other_utterance(sess)
+
+
+def _flush_other_utterance(sess: RunningSession) -> None:
+    """Evaluate the buffered OTHER utterance (no-op when empty) and hand candidates to the worker."""
+    utterance = " ".join(sess.other_buffer).strip()
+    sess.other_buffer.clear()
+    sess.other_tags.clear()
+    if not utterance or not looks_like_question(utterance, STATE.language):
+        return
+    sess.auto_pending = utterance  # replaces an older candidate not yet started
+    if sess.auto_task is None or sess.auto_task.done():
+        sess.auto_task = asyncio.create_task(_auto_worker(sess), name="auto-answer")
+
+
+async def _auto_worker(sess: RunningSession) -> None:
+    """Run auto-answer candidates one at a time, always the latest one (cancelled on stop)."""
+    while sess.auto_pending is not None and _auto_active(sess):
+        utterance, sess.auto_pending = sess.auto_pending, None
+        try:
+            await _auto_answer(sess, utterance)
+        except Exception as e:
+            print(f"[auto-answer] failed: {e!r}")
+
+
+async def _auto_answer(sess: RunningSession, utterance: str) -> None:
+    """Confirm with the LLM classifier that OTHER expects an answer, then generate suggestions."""
+    lang = STATE.language
+    context = "\n".join(f'{x["speaker"]}: {x["text"]}' for x in STATE.history[-AUTO_CONTEXT_LINES:])
+    is_question = await asyncio.to_thread(
+        classify_question, lang=lang, transcript=context, utterance=utterance
+    )
+    if not is_question or not _auto_active(sess):
+        return
+    transcript = _build_transcript(
+        list(STATE.history),
+        history_label="HISTORIQUE DE LA CONVERSATION",
+        current_label="CONVERSATION ACTUELLE",
+    )
+    profile = _load_profile(STATE.current_profile)
+    await broadcast({"type": "suggestions_pending", "auto": True, "question": utterance})
+    finished = False
+    try:
+        await _suggest_and_broadcast(lang=lang, transcript=transcript, profile=profile, auto=True)
+        finished = True
+    finally:
+        # The client shows placeholders until `suggestions` or `error`: never leave it waiting
+        # (e.g. task cancelled because the session stopped)
+        if not finished:
+            await broadcast({"type": "error", "message": "Réponse automatique annulée"})
+
+
 def _handle_audio_blob(msg: dict[str, Any]) -> None:
     """Route a browser mic chunk to the current mic stream (synchronous: atomic vs stop/takeover)."""
     sess = STATE.session
@@ -665,7 +897,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     STATE.clients.add(ws)
     try:
-        await ws.send_text(json.dumps({"type": "state", "running": STATE.running, "language": STATE.language}))
+        await ws.send_text(json.dumps(_state_msg()))
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -703,6 +935,7 @@ async def api_state() -> JSONResponse:
         "ok": True,
         "running": STATE.running,
         "language": STATE.language,
+        "auto_answer": STATE.auto_answer,
         **meta,
     })
 
@@ -874,6 +1107,7 @@ async def api_ask() -> JSONResponse:
             return JSONResponse({"ok": False, "error": "not running"}, status_code=400)
         history = list(STATE.history)
         profile_id = STATE.current_profile
+        lang = STATE.language
 
     profile_content = _load_profile(profile_id)
     transcript = _build_transcript(
@@ -885,26 +1119,25 @@ async def api_ask() -> JSONResponse:
     if not transcript:
         return JSONResponse({"ok": False, "error": "no transcript yet"}, status_code=400)
 
-    try:
-        sugg = await asyncio.to_thread(
-            generate_suggestions,
-            lang=STATE.language,
-            transcript=transcript,
-            profile=profile_content
-        )
-        msg = {
-            "type": "suggestions",
-            "language": STATE.language,
-            "best": sugg.best,
-            "alternative": sugg.alternative,
-            "clarifying_question": sugg.clarifying_question,
-            "technical_terms": sugg.technical_terms,
-        }
-        await broadcast(msg)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        await broadcast({"type": "error", "message": f"Erreur Gemini: {e}"})
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    error = await _suggest_and_broadcast(lang=lang, transcript=transcript, profile=profile_content, auto=False)
+    if error:
+        return JSONResponse({"ok": False, "error": error}, status_code=400)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/auto-answer")
+async def api_auto_answer(payload: dict[str, Any]) -> JSONResponse:
+    """Enable/disable the auto-answer mode (suggestions generated when OTHER asks ME a question)."""
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return JSONResponse({"ok": False, "error": "enabled must be a boolean"}, status_code=400)
+
+    async with STATE.lock:
+        STATE.auto_answer = enabled
+        if STATE.session is not None:
+            STATE.session.reset_auto()
+        await broadcast({"type": "auto_answer_changed", "enabled": enabled})
+        return JSONResponse({"ok": True, "enabled": enabled})
 
 
 @app.post("/api/chat")

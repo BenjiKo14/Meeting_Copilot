@@ -11,7 +11,9 @@ Outil local Windows pour t'aider pendant un entretien ou une discussion Teams :
   - Meilleure réponse concise
   - Alternative plus détaillée
   - Question de clarification
+  - Points clés à mentionner
   - Explication des termes techniques mentionnés
+- **Réponse automatique** (optionnelle) : suggestions générées dès qu'OTHER te pose une question
 - **Mode speaker** : automatique (micro=ME, loopback=OTHER) ou manuel
 
 ## Prérequis
@@ -91,6 +93,24 @@ http://127.0.0.1:8001/
 | **Mode Auto/Manuel** | Auto = mic→ME, loopback→OTHER. Manuel = tu choisis avec le bouton ME/OTHER |
 | **Proposer une réponse** | Génère des suggestions basées sur la conversation |
 
+### Points clés
+
+Chaque suggestion contient aussi 3 à 5 **points clés** : des mots-clés ou idées très courts (2 à 8 mots) à placer dans ta réponse, pas des phrases toutes faites. Comme pour les réponses, tout ce qui touche à ton expérience personnelle vient uniquement de ton profil.
+
+La meilleure réponse et les points clés sont générés par un appel rapide, en parallèle de l'alternative détaillée, de la question de clarification et des termes techniques : ils s'affichent en premier (environ 2 à 3 s), le reste suit. Le niveau de réflexion de Gemini se règle avec `GEMINI_THINKING_LEVEL` (`low` par défaut).
+
+### Réponse automatique
+
+Quand la réponse automatique est activée (depuis l'interface, ou `AUTO_ANSWER=true` dans `.env` pour l'activer au démarrage), il n'est plus nécessaire de cliquer sur « Proposer une réponse » :
+
+1. Dès qu'OTHER termine une phrase (fin d'énoncé détectée par Deepgram), un filtre rapide vérifie qu'elle ressemble à une question ou à une demande (« ? », « comment », « pouvez-vous », « parlez-moi de », « tell me about »…).
+2. Un modèle Gemini léger (`GEMINI_CLASSIFIER_MODEL`, `gemini-3.5-flash-lite` par défaut) confirme qu'OTHER attend une réponse de ta part maintenant, en tenant compte des 15 dernières lignes de la conversation.
+3. Si c'est le cas, les suggestions sont générées comme avec le bouton.
+
+Une seule génération automatique tourne à la fois : si OTHER enchaîne plusieurs questions pendant une génération, seule la dernière est traitée ensuite. Le bouton « Proposer une réponse » (et son raccourci global) reste disponible à tout moment. Fonctionne dans les deux modes speaker : c'est le texte attribué à OTHER qui compte.
+
+> Chaque question détectée déclenche un appel au classifieur puis un appel de génération : désactive le mode si tu veux maîtriser ta consommation d'API.
+
 ### Profils
 
 Crée des fichiers `.txt` dans le dossier `profiles/` avec tes informations (CV, compétences, projets). Le LLM utilisera ces infos pour personnaliser ses réponses **sans inventer de faux faits**.
@@ -120,7 +140,7 @@ hotkeys/meeting-copilot.ahk
 
 | Raccourci | Action |
 |-----------|--------|
-| `Ctrl+Alt+Space` | Proposer une réponse |
+| `Ctrl+Shift+Space` | Proposer une réponse |
 | `Ctrl+Alt+L` | Toggle FR/EN |
 | `Ctrl+Alt+S` | Start/Stop |
 

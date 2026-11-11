@@ -1,5 +1,5 @@
 ; Meeting Copilot — Hotkeys globaux Windows (AutoHotkey v1)
-; - Ctrl+Alt+Space => Proposer une réponse      (POST /api/ask)
+; - Ctrl+Shift+Space => Proposer une réponse    (POST /api/ask)
 ; - Ctrl+Alt+L     => Toggle FR/EN              (POST /api/toggle-language)
 ; - Ctrl+Alt+S     => Start/Stop                (POST /api/toggle-running)
 ; L'état (langue, session en cours) est géré uniquement par le serveur :
@@ -12,7 +12,7 @@ SetWorkingDir %A_ScriptDir%
 
 global BaseUrl := "http://127.0.0.1:8001"
 
-^!Space::
+^+Space::
   HttpPost(BaseUrl "/api/ask", "{}")
 return
 
