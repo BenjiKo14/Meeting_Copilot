@@ -176,7 +176,7 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .msg.interim { color: rgba(255,255,255,.62); font-style: italic; }
+    .msg.interim, .msg span.interim { color: rgba(255,255,255,.62); font-style: italic; }
     .small {
       font-size: 12px;
       color: var(--muted);
@@ -472,7 +472,9 @@
     // Speaker mode: 'auto' (mic=ME, loopback=OTHER) or 'manual' (user toggles)
     let speakerMode = 'auto';
     let currentSpeaker = 'ME';
-    
+    // Session running state (declared early: read by btnAsk handler and setState wrapper)
+    let lastRunning = false;
+
     function updateSpeakerModeUI() {
       if (speakerMode === 'auto') {
         btnSpeakerMode.textContent = '🔄 Auto';
@@ -535,13 +537,22 @@
       // Remove existing interim line for that speaker
       const interimId = `interim-${speaker}`;
       const old = document.getElementById(interimId);
-      if (!isFinal && old) old.remove();
+      if (old) old.remove();
 
-      // For final transcripts: concatenate if same speaker as last final
-      if (isFinal && speaker === lastFinalSpeaker && lastFinalLine) {
+      // Same speaker as the last final block: continue in that block (final text appended,
+      // interim text shown inline in italics until its final arrives)
+      if (speaker === lastFinalSpeaker && lastFinalLine) {
         const msgEl = lastFinalLine.querySelector('.msg');
         if (msgEl) {
-          msgEl.textContent += ' ' + text;
+          if (isFinal) {
+            msgEl.appendChild(document.createTextNode(' ' + text));
+          } else {
+            const span = document.createElement('span');
+            span.id = interimId;
+            span.className = 'interim';
+            span.textContent = ' ' + text;
+            msgEl.appendChild(span);
+          }
           timeline.scrollTop = timeline.scrollHeight;
           return;
         }
@@ -593,11 +604,29 @@
       btnStart.disabled = running;
     }
 
-    btnStart.onclick = async () => { setError(''); await post('/api/start'); };
-    btnStop.onclick = async () => { setError(''); await post('/api/stop'); };
-    btnReset.onclick = async () => { 
-      setError(''); 
-      await post('/api/reset'); 
+    function errText(e) {
+      return (e && e.message) || String(e);
+    }
+
+    btnStart.onclick = async () => {
+      setError('');
+      try { await post('/api/start'); }
+      catch (e) { setError('Erreur démarrage: ' + errText(e)); }
+    };
+    btnStop.onclick = async () => {
+      setError('');
+      try { await post('/api/stop'); }
+      catch (e) { setError('Erreur arrêt: ' + errText(e)); }
+    };
+    btnReset.onclick = async () => {
+      setError('');
+      try {
+        await post('/api/reset');
+      } catch (e) {
+        setError('Erreur reset: ' + errText(e));
+        return;
+      }
+      pendingAsk = null;
       timeline.innerHTML = '';
       lastFinalSpeaker = null;
       lastFinalLine = null;
@@ -606,10 +635,44 @@
       clarifyEl.textContent = '—';
       techTermsEl.textContent = '—';
     };
-    btnFR.onclick = async () => { setError(''); await post('/api/language', {language:'fr'}); };
-    btnEN.onclick = async () => { setError(''); await post('/api/language', {language:'en'}); };
-    btnAsk.onclick = async () => { 
-      setError(''); 
+    btnFR.onclick = async () => {
+      setError('');
+      try { await post('/api/language', {language:'fr'}); }
+      catch (e) { setError('Erreur changement de langue: ' + errText(e)); }
+    };
+    btnEN.onclick = async () => {
+      setError('');
+      try { await post('/api/language', {language:'en'}); }
+      catch (e) { setError('Erreur changement de langue: ' + errText(e)); }
+    };
+
+    // Snapshot of the suggestion blocks taken before showing the "thinking" placeholders.
+    // Non-null only while placeholders are displayed.
+    let pendingAsk = null;
+
+    function restoreSuggestions() {
+      if (!pendingAsk) return;
+      const snap = pendingAsk;
+      pendingAsk = null;
+      bestEl.textContent = snap.best || '—';
+      altLongEl.textContent = snap.altLong || '—';
+      clarifyEl.textContent = snap.clarify || '—';
+      if (snap.techTerms.length > 0) {
+        techTermsEl.replaceChildren(...snap.techTerms);
+      } else {
+        techTermsEl.textContent = '—';
+      }
+    }
+
+    function askErrorMessage(e) {
+      const raw = errText(e);
+      if (raw === 'no transcript yet') return 'Pas encore de transcription.';
+      if (raw === 'not running') return "La session n'est pas démarrée.";
+      return raw;
+    }
+
+    btnAsk.onclick = async () => {
+      setError('');
       // Show loading state
       btnAsk.classList.add('btn-loading');
       btnAsk.disabled = true;
@@ -617,6 +680,14 @@
       btnAsk.textContent = 'Réflexion...';
       btnAsk.style.paddingRight = '30px';
       
+      // Snapshot current suggestions so they can be restored on failure
+      pendingAsk = {
+        best: bestEl.textContent,
+        altLong: altLongEl.textContent,
+        clarify: clarifyEl.textContent,
+        techTerms: Array.from(techTermsEl.childNodes)
+      };
+
       // Show thinking animation in suggestion blocks
       bestEl.innerHTML = '<span class="thinking">🤔 Analyse de la conversation<span class="thinking-dots"></span></span>';
       altLongEl.innerHTML = '<span class="thinking">💭 Préparation de la réponse détaillée<span class="thinking-dots"></span></span>';
@@ -625,6 +696,11 @@
       
       try {
         await post('/api/ask');
+      } catch (e) {
+        // If a WS 'error' already restored the blocks (LLM failure), keep its more detailed message
+        const alreadyHandled = !pendingAsk;
+        restoreSuggestions();
+        if (!alreadyHandled) setError(askErrorMessage(e));
       } finally {
         // Reset button state
         btnAsk.classList.remove('btn-loading');
@@ -655,8 +731,15 @@
     const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
     const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
 
-    ws.onopen = () => setError('');
+    ws.onopen = () => { setError(''); flushMicQueue(); };
     ws.onerror = () => setError('WebSocket: erreur de connexion. Le backend tourne bien ?');
+    // No auto-reconnect: on close, stop capturing (otherwise chunks pile up in micOutQueue forever)
+    ws.onclose = () => {
+      setState({ running: false, language: langEl.textContent });
+      stopMicCapture();
+      micOutQueue.length = 0;
+      setError('Connexion au serveur perdue. Recharge la page une fois le serveur relancé.');
+    };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'state') setState(msg);
@@ -664,16 +747,25 @@
         appendLine(msg.speaker, msg.text, !!msg.is_final);
       }
       if (msg.type === 'suggestions') {
+        pendingAsk = null; // fresh suggestions: never restore the old snapshot over them
         bestEl.textContent = msg.best || '—';
         altLongEl.textContent = msg.alternative || '—';
         clarifyEl.textContent = msg.clarifying_question || '—';
-        
-        // Display technical terms explanations
+
+        // Display technical terms explanations (DOM built with textContent: LLM output is untrusted)
         const terms = msg.technical_terms || [];
         if (terms.length > 0) {
-          techTermsEl.innerHTML = terms.map(t => 
-            `<div style="margin-bottom: 8px;"><strong style="color: var(--other);">${t.term}</strong>: ${t.explanation}</div>`
-          ).join('');
+          const nodes = terms.map(t => {
+            const row = document.createElement('div');
+            row.style.marginBottom = '8px';
+            const strong = document.createElement('strong');
+            strong.style.color = 'var(--other)';
+            strong.textContent = String(t.term ?? '');
+            row.appendChild(strong);
+            row.appendChild(document.createTextNode(': ' + String(t.explanation ?? '')));
+            return row;
+          });
+          techTermsEl.replaceChildren(...nodes);
         } else {
           techTermsEl.textContent = '—';
         }
@@ -683,7 +775,10 @@
         lastFinalSpeaker = null;
         lastFinalLine = null;
       }
-      if (msg.type === 'error') setError(msg.message || 'Erreur inconnue.');
+      if (msg.type === 'error') {
+        restoreSuggestions();
+        setError(msg.message || 'Erreur inconnue.');
+      }
     };
 
     // ============ MICROPHONE CAPTURE (browser-side) using MediaRecorder ============
@@ -691,11 +786,61 @@
     let micStream = null;
     let mediaRecorder = null;
 
+    // Ordered send pipeline: chunks are encoded one after another (promise chain) and
+    // queued as serialized messages; the queue is flushed in order whenever the WS is open.
+    // Never drop a chunk: the first one carries the WebM header.
+    let micEncodeChain = Promise.resolve();
+    const micOutQueue = [];
+
+    function flushMicQueue() {
+      while (micOutQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+        ws.send(micOutQueue.shift());
+      }
+    }
+
+    function newStreamId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      // Fallback for non-secure contexts (randomUUID unavailable)
+      const bytes = new Uint8Array(16);
+      if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+        window.crypto.getRandomValues(bytes);
+      } else {
+        for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+      }
+      bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+      bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
+      const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    // Chunked conversion: avoids the argument-count limit of String.fromCharCode(...bytes)
+    function bytesToBase64(bytes) {
+      const CHUNK = 0x8000;
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      return btoa(binary);
+    }
+
+    // Incremented on every start/stop: a getUserMedia that resolves after a stop (or a newer
+    // start) is discarded instead of leaving an orphan MediaRecorder running.
+    let micGeneration = 0;
+
     async function startMicCapture() {
       console.log('startMicCapture called');
+      const gen = ++micGeneration;
       try {
         // Request microphone access - browser will show device picker
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (gen !== micGeneration || !lastRunning) {
+          stream.getTracks().forEach(track => track.stop());
+          console.log('Stale mic capture discarded');
+          return;
+        }
+        micStream = stream;
         console.log('getUserMedia success, tracks:', micStream.getTracks().length);
 
         // Create MediaRecorder to capture audio chunks
@@ -705,35 +850,41 @@
           : MediaRecorder.isTypeSupported('audio/webm') 
             ? 'audio/webm' 
             : '';
-        mediaRecorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
-        
+        const recorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
+        mediaRecorder = recorder;
+        // New stream id per capture: the backend restarts its Deepgram mic connection on a new id
+        const streamId = newStreamId();
+
         let chunkCount = 0;
-        mediaRecorder.addEventListener('dataavailable', async (event) => {
+        recorder.addEventListener('dataavailable', (event) => {
+          if (!event.data || event.data.size === 0) return;
           chunkCount++;
-          if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-            // Convert Blob to base64 and send
-            const arrayBuffer = await event.data.arrayBuffer();
-            const bytes = new Uint8Array(arrayBuffer);
-            const base64 = btoa(String.fromCharCode(...bytes));
-            
-            // Capture speaker at the moment audio is sent (not when transcription comes back)
-            const speakerAtCapture = (speakerMode === 'manual') ? currentSpeaker : 'ME';
-            
-            if (chunkCount <= 5) {
-              console.log(`Sending audio chunk ${chunkCount}, size: ${event.data.size} bytes, speaker: ${speakerAtCapture}`);
-            }
-            
-            ws.send(JSON.stringify({ 
-              type: 'audio_blob', 
-              data: base64, 
-              mimeType: event.data.type || mediaRecorder.mimeType,
-              speaker: speakerAtCapture  // Send speaker with audio
-            }));
-          }
+          const chunkIndex = chunkCount;
+          const blob = event.data;
+          // Capture speaker at the moment audio is produced (not when transcription comes back)
+          const speakerAtCapture = (speakerMode === 'manual') ? currentSpeaker : 'ME';
+          const chunkMime = blob.type || recorder.mimeType;
+
+          micEncodeChain = micEncodeChain
+            .then(async () => {
+              const bytes = new Uint8Array(await blob.arrayBuffer());
+              if (chunkIndex <= 5) {
+                console.log(`Sending audio chunk ${chunkIndex}, size: ${blob.size} bytes, speaker: ${speakerAtCapture}`);
+              }
+              micOutQueue.push(JSON.stringify({
+                type: 'audio_blob',
+                data: bytesToBase64(bytes),
+                mimeType: chunkMime,
+                speaker: speakerAtCapture,  // Send speaker with audio
+                stream_id: streamId
+              }));
+              flushMicQueue();
+            })
+            .catch((err) => console.error('Mic chunk encode/send error:', err));
         });
 
         // Start recording with 250ms chunks (as recommended by Deepgram)
-        mediaRecorder.start(250);
+        recorder.start(250);
         console.log('MediaRecorder started, mimeType:', mediaRecorder.mimeType);
       } catch (err) {
         setError('Erreur micro: ' + (err.message || err));
@@ -742,6 +893,7 @@
     }
 
     function stopMicCapture() {
+      micGeneration++;
       if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         mediaRecorder.stop();
         mediaRecorder = null;
@@ -753,8 +905,7 @@
       console.log('Microphone capture stopped');
     }
 
-    // Start/stop mic when session starts/stops
-    let lastRunning = false;
+    // Start/stop mic when session starts/stops (lastRunning is declared at the top)
     const originalSetState = setState;
     setState = function(s) {
       originalSetState(s);
@@ -896,6 +1047,7 @@
         await post('/api/meetings/new', { name });
         await loadMeetings();
         // Clear UI
+        pendingAsk = null;
         timeline.innerHTML = '';
         lastFinalSpeaker = null;
         lastFinalLine = null;

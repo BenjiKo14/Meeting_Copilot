@@ -1,41 +1,39 @@
 ; Meeting Copilot — Hotkeys globaux Windows (AutoHotkey v1)
-; - Ctrl+Alt+Space => Proposer une réponse
-; - Ctrl+Alt+L     => Toggle FR/EN
-; - Ctrl+Alt+S     => Start/Stop
+; - Ctrl+Alt+Space => Proposer une réponse      (POST /api/ask)
+; - Ctrl+Alt+L     => Toggle FR/EN              (POST /api/toggle-language)
+; - Ctrl+Alt+S     => Start/Stop                (POST /api/toggle-running)
+; L'état (langue, session en cours) est géré uniquement par le serveur :
+; les raccourcis restent cohérents avec les actions faites depuis l'interface web.
 
 #NoEnv
 #SingleInstance Force
 SendMode Input
 SetWorkingDir %A_ScriptDir%
 
-global Lang := "fr"
-global Running := 0
+global BaseUrl := "http://127.0.0.1:8001"
 
 ^!Space::
-  HttpPost("http://127.0.0.1:8001/api/ask", "{}")
+  HttpPost(BaseUrl "/api/ask", "{}")
 return
 
 ^!l::
-  if (Lang = "en")
-    Lang := "fr"
-  else
-    Lang := "en"
-  HttpPost("http://127.0.0.1:8001/api/language", "{""language"":""" Lang """}")
+  HttpPost(BaseUrl "/api/toggle-language", "{}")
 return
 
 ^!s::
-  if (Running = 1) {
-    HttpPost("http://127.0.0.1:8001/api/stop", "{}")
-    Running := 0
-  } else {
-    HttpPost("http://127.0.0.1:8001/api/start", "{}")
-    Running := 1
-  }
+  HttpPost(BaseUrl "/api/toggle-running", "{}")
 return
 
 HttpPost(url, json) {
-  whr := ComObjCreate("WinHttp.WinHttpRequest.5.1")
-  whr.Open("POST", url, false)
-  whr.SetRequestHeader("Content-Type", "application/json")
-  whr.Send(json)
+  try {
+    whr := ComObjCreate("WinHttp.WinHttpRequest.5.1")
+    whr.Open("POST", url, false)
+    whr.SetRequestHeader("Content-Type", "application/json")
+    whr.Send(json)
+    if (whr.Status >= 400)
+      TrayTip, Meeting Copilot, % "Erreur HTTP " whr.Status " sur " url, 3, 2
+  }
+  catch {
+    TrayTip, Meeting Copilot, % "Serveur injoignable (" url ")", 3, 2
+  }
 }

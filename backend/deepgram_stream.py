@@ -7,6 +7,25 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+
+# Send a KeepAlive when no audio has been sent for this long (Deepgram times out after 10 s).
+KEEPALIVE_INTERVAL_S = 3.0
+# After stop_event is set, keep forwarding results for at most this long waiting for the server close.
+CLOSE_DEADLINE_S = 1.8
+# Bound on the websocket closing handshake when leaving the connection context.
+CLOSE_HANDSHAKE_TIMEOUT_S = 0.4
+# Poll period of sender/receiver loops: bounds how late stop_event is noticed.
+_POLL_S = 0.1
+# Worst case from stop_event.set() to return: _POLL_S + CLOSE_DEADLINE_S + CLOSE_HANDSHAKE_TIMEOUT_S ~= 2.3 s.
+
+_KEEPALIVE_MSG = json.dumps({"type": "KeepAlive"})  # str => text frame, as required by Deepgram
+_CLOSE_STREAM_MSG = json.dumps({"type": "CloseStream"})
+
+
+def _close_code(exc: ConnectionClosed) -> int:
+    frame = exc.rcvd or exc.sent
+    return frame.code if frame is not None else 1006  # 1006 = closed without a close frame
 
 
 @dataclass(frozen=True)
@@ -96,9 +115,14 @@ async def run_deepgram(
 
     on_event receives dict containing:
       - text, is_final, ts, raw, tag
+
+    Sends KeepAlive during audio silence. When stop_event is set, sends CloseStream and keeps
+    forwarding results until the server closes or CLOSE_DEADLINE_S elapses, then returns.
+    Raises RuntimeError if the connection closes (normally or not) while not stopping.
     """
     headers = {"Authorization": f"Token {cfg.api_key}"}
     last_interim: Optional[str] = None
+    loop = asyncio.get_running_loop()
 
     async with websockets.connect(
         cfg.url(),
@@ -106,24 +130,65 @@ async def run_deepgram(
         ping_interval=10,
         ping_timeout=20,
         max_queue=64,
+        close_timeout=CLOSE_HANDSHAKE_TIMEOUT_S,
     ) as ws:
         async def sender() -> None:
-            while not stop_event.is_set():
-                try:
-                    chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    continue
-                await ws.send(chunk)
+            # Deepgram closes the stream (NET-0001) after 10 s without audio or KeepAlive.
+            last_sent = loop.time()
+            try:
+                while not stop_event.is_set():
+                    try:
+                        chunk = await asyncio.wait_for(audio_queue.get(), timeout=_POLL_S)
+                    except asyncio.TimeoutError:
+                        if loop.time() - last_sent >= KEEPALIVE_INTERVAL_S:
+                            await ws.send(_KEEPALIVE_MSG)
+                            last_sent = loop.time()
+                        continue
+                    await ws.send(chunk)
+                    last_sent = loop.time()
+
+                # Graceful stop: flush already-queued audio, then ask Deepgram to finalize and close.
+                while not audio_queue.empty():
+                    await ws.send(audio_queue.get_nowait())
+                await ws.send(_CLOSE_STREAM_MSG)
+            except ConnectionClosed:
+                # The receiver is the authority on connection closure and reports it.
+                return
 
         async def receiver() -> None:
             nonlocal last_interim
-            while not stop_event.is_set():
+            deadline: Optional[float] = None
+            while True:
+                timeout = _POLL_S
+                if stop_event.is_set():
+                    if deadline is None:
+                        deadline = loop.time() + CLOSE_DEADLINE_S
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        return
+                    timeout = min(timeout, remaining)
+
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                 except asyncio.TimeoutError:
                     continue
+                except ConnectionClosedOK as e:
+                    if stop_event.is_set():
+                        return
+                    raise RuntimeError(
+                        f"Deepgram [{tag}] a fermé la connexion (code {_close_code(e)}), transcription interrompue"
+                    ) from e
+                except ConnectionClosedError as e:
+                    if stop_event.is_set():
+                        return
+                    raise RuntimeError(
+                        f"Deepgram [{tag}] connexion perdue (code {_close_code(e)}): {e}"
+                    ) from e
 
-                payload = json.loads(raw)
+                try:
+                    payload = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
                 text, is_final = _extract_transcript(payload)
                 if not text:
                     continue
@@ -146,5 +211,20 @@ async def run_deepgram(
                     }
                 )
 
-        await asyncio.gather(sender(), receiver())
+        recv_task = asyncio.create_task(receiver(), name=f"deepgram-{tag}-recv")
+        send_task = asyncio.create_task(sender(), name=f"deepgram-{tag}-send")
+        tasks = [recv_task, send_task]
+        try:
+            # The receiver decides when the stream is over; the sender may finish first.
+            pending: set[asyncio.Task[None]] = set(tasks)
+            while recv_task in pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    exc = t.exception()
+                    if exc is not None:
+                        raise exc
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import itertools
 import json
 import os
@@ -10,13 +11,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import numpy as np
 import pyaudiowpatch as pyaudio
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.deepgram_stream import DeepgramConfig, run_deepgram
@@ -38,6 +38,15 @@ KEYWORDS_FILE = Path(__file__).resolve().parents[1] / "keywords.txt"
 # Transcript window sizes for LLM context
 TRANSCRIPT_HISTORY_WINDOW = 200
 TRANSCRIPT_CURRENT_WINDOW = 80
+
+# Max time given to Deepgram tasks to flush final transcripts on stop before cancelling them
+STOP_GRACE_SECONDS = 2.5
+
+# Only these hostnames may reach the server (DNS-rebinding protection)
+ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "[::1]"})
+
+# stream_id used for mic chunks sent by clients that don't provide one
+LEGACY_STREAM_ID = "legacy"
 
 # Module-level keywords cache — loaded once at first session start
 _keywords_cache: Optional[tuple[str, ...]] = None
@@ -101,10 +110,12 @@ def _load_meeting(meeting_id: str) -> list[dict[str, Any]]:
 
 
 def _save_meeting(meeting_id: str, history: list[dict[str, Any]]) -> None:
+    """Atomic write (temp file + os.replace): a crash mid-write never truncates the meeting."""
+    target = _get_meeting_file(meeting_id)
+    tmp = target.with_suffix(".json.tmp")
     try:
-        _get_meeting_file(meeting_id).write_text(
-            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
     except Exception:
         pass
 
@@ -122,6 +133,34 @@ def _delete_meeting(meeting_id: str) -> bool:
 
 def _generate_meeting_id() -> str:
     return datetime.now().strftime("Meeting_%Y-%m-%d_%H-%M")
+
+
+def _unique_meeting_id(base_id: str) -> str:
+    """Return base_id, or base_id_2, base_id_3... if a meeting file already exists."""
+    meeting_id = base_id
+    suffix = 2
+    while _get_meeting_file(meeting_id).exists():
+        meeting_id = f"{base_id}_{suffix}"
+        suffix += 1
+    return meeting_id
+
+
+def _host_name(host: str) -> str:
+    """Extract the lowercase hostname (without port) from a Host header value."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[: end + 1] if end != -1 else host
+    return host.split(":", 1)[0]
+
+
+def _is_local_request(host: Optional[str], origin: Optional[str]) -> bool:
+    """Allow only requests addressed to localhost, and same-origin when an Origin header is sent."""
+    if not host or _host_name(host) not in ALLOWED_HOSTNAMES:
+        return False
+    if origin is None:
+        return True
+    return origin.strip().lower() == f"http://{host.strip().lower()}"
 
 
 def _list_profiles() -> list[dict[str, Any]]:
@@ -185,7 +224,7 @@ def _build_transcript(
     empty_fallback: str = "",
 ) -> str:
     """Build a two-section transcript string from history, or return empty_fallback."""
-    history_items = history[-TRANSCRIPT_HISTORY_WINDOW:]
+    history_items = history[-TRANSCRIPT_HISTORY_WINDOW:-TRANSCRIPT_CURRENT_WINDOW]
     current_items = history[-TRANSCRIPT_CURRENT_WINDOW:]
 
     def _fmt(items: list[dict[str, Any]]) -> str:
@@ -205,18 +244,68 @@ def _build_transcript(
 @dataclass
 class RunningSession:
     stop_event: asyncio.Event
-    tasks: list[asyncio.Task[Any]]
     loop_stream: pyaudio.Stream
     loop_thread: threading.Thread
-    mic_queue: "asyncio.Queue[bytes]"
     loop_queue: "asyncio.Queue[bytes]"
     pa_instance: pyaudio.PyAudio
+    mic_cfg: DeepgramConfig
+    # Stream ids that must be ignored (shared across sessions, see AppState.retired_stream_ids)
+    retired_stream_ids: set[str]
+    # Live Deepgram tasks (loopback + current mic stream), kept up to date on mic takeover
+    tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+    # Set whenever `tasks` changes so the supervisor re-reads it
+    tasks_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    on_mic: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None
+    mic_task: Optional[asyncio.Task[Any]] = None
+    mic_queue: Optional["asyncio.Queue[bytes]"] = None
+    mic_stream_id: Optional[str] = None
+    # "legacy" is retired per session only (not shared), see is_retired()
+    legacy_retired: bool = False
+    # Arrival time of the first chunk of the current mic stream (Deepgram's `start` time base)
+    mic_stream_start: float = field(default_factory=time.time)
+    supervisor: Optional[asyncio.Task[Any]] = None
     speaker_history: list = field(default_factory=list)
-    session_start_time: float = field(default_factory=time.time)
+
+    def start_mic_stream(self, stream_id: str) -> None:
+        """Take over the mic: retire the current stream and open a fresh Deepgram connection.
+
+        Synchronous on purpose (no await) so it is atomic relative to the event loop.
+        """
+        if self.mic_stream_id == LEGACY_STREAM_ID:
+            self.legacy_retired = True
+        elif self.mic_stream_id is not None:
+            self.retired_stream_ids.add(self.mic_stream_id)
+        old_task = self.mic_task
+        self.mic_stream_id = stream_id
+        self.mic_queue = asyncio.Queue()  # unbounded: dropping a WebM chunk corrupts the stream
+        self.mic_task = asyncio.create_task(
+            run_deepgram(
+                cfg=self.mic_cfg,
+                audio_queue=self.mic_queue,
+                on_event=self.on_mic,
+                stop_event=self.stop_event,
+                tag="mic",
+            ),
+            name="deepgram-mic",
+        )
+        self.tasks = [t for t in self.tasks if t is not old_task] + [self.mic_task]
+        if old_task is not None:
+            if old_task.done() and not old_task.cancelled() and old_task.exception() is not None:
+                # Failed before the supervisor saw it: surface the cause instead of losing it
+                print(f"[mic] previous Deepgram mic task failed: {old_task.exception()!r}")
+            old_task.cancel()
+        self.mic_stream_start = time.time()
+        self.speaker_history = []
+        self.tasks_changed.set()
+
+    def is_retired(self, stream_id: str) -> bool:
+        if stream_id == LEGACY_STREAM_ID:
+            return self.legacy_retired
+        return stream_id in self.retired_stream_ids
 
     def record_speaker(self, speaker: str) -> None:
         """Record a speaker change with current timestamp."""
-        elapsed = time.time() - self.session_start_time
+        elapsed = time.time() - self.mic_stream_start
         self.speaker_history.append((elapsed, speaker))
         # Keep only last 60 seconds of history
         cutoff = elapsed - 60
@@ -248,6 +337,9 @@ class AppState:
         self.current_mic_speaker: str = "ME"
         self.history: list[dict[str, Any]] = []
         self.session: Optional[RunningSession] = None
+        # Mic stream ids already used: late chunks from a previous capture (old tab,
+        # recorder stopped during a restart) must never reopen a Deepgram connection.
+        self.retired_stream_ids: set[str] = set()
 
     def load_meeting(self, meeting_id: str) -> None:
         self.current_meeting = meeting_id
@@ -255,8 +347,6 @@ class AppState:
 
     def _buffer_append(self, speaker: str, text: str, ts: float) -> None:
         self.history.append({"speaker": speaker, "text": text, "ts": ts})
-        if len(self.history) > 500:
-            self.history = self.history[-500:]
         _save_meeting(self.current_meeting, self.history)
 
     def reset_history(self) -> None:
@@ -267,13 +357,14 @@ class AppState:
 STATE = AppState()
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+
+@app.middleware("http")
+async def local_only(request: Request, call_next: Callable[[Request], Awaitable[Any]]) -> Any:
+    """Reject requests from other websites (cross-origin) or via a rebound DNS name."""
+    if not _is_local_request(request.headers.get("host"), request.headers.get("origin")):
+        return JSONResponse({"ok": False, "error": "Accès refusé"}, status_code=403)
+    return await call_next(request)
 
 
 def _web_root() -> Path:
@@ -331,13 +422,42 @@ def _require_env(name: str) -> str:
     return v
 
 
+async def _supervise(sess: RunningSession) -> None:
+    """Watch the session's live Deepgram tasks and stop the session if one ends unexpectedly.
+
+    A mic task cancelled by a takeover is no longer in `sess.tasks` and is ignored.
+    """
+    try:
+        while not sess.stop_event.is_set():
+            sess.tasks_changed.clear()
+            watched = list(sess.tasks)
+            changed = asyncio.create_task(sess.tasks_changed.wait())
+            try:
+                done, _ = await asyncio.wait([*watched, changed], return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                changed.cancel()
+            ended = [t for t in done if t is not changed and t in sess.tasks]
+            if not ended:
+                continue  # task list changed (mic takeover): watch the new tasks
+            if sess.stop_event.is_set():
+                break
+            errors = [t.exception() for t in ended if not t.cancelled() and t.exception() is not None]
+            if errors:
+                await broadcast({"type": "error", "message": f"Erreur Deepgram: {errors[0]}"})
+            break
+    finally:
+        async with STATE.lock:
+            # Only stop our own session: a restart (language switch) may have replaced it
+            if STATE.session is sess:
+                await _stop_locked()
+
+
 async def start_session() -> None:
     deepgram_key = _require_env("DEEPGRAM_API_KEY")
 
     stop_event = asyncio.Event()
     event_loop = asyncio.get_running_loop()
 
-    mic_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=80)
     loop_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=80)
 
     p = pyaudio.PyAudio()
@@ -377,8 +497,8 @@ async def start_session() -> None:
                 data = loop_stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 audio = np.frombuffer(data, dtype=np.int16)
 
-                if device_channels == 2:
-                    audio = audio.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                if device_channels > 1:
+                    audio = audio.reshape(-1, device_channels).mean(axis=1).astype(np.int16)
 
                 if needs_resample:
                     audio = sig.resample_poly(audio, up, down).astype(np.int16)
@@ -394,10 +514,12 @@ async def start_session() -> None:
     loop_thread.start()
 
     async def on_mic(ev: dict[str, Any]) -> None:
-        if STATE.session and STATE.speaker_mode == "manual":
+        # Bound to `sess` (not STATE.session): finals drained during stop arrive after
+        # STATE.session has been cleared and must still use this session's timeline.
+        if STATE.speaker_mode == "manual":
             raw = ev.get("raw", {})
             audio_start = raw.get("start", 0.0)
-            speaker = STATE.session.get_speaker_at(audio_start)
+            speaker = sess.get_speaker_at(audio_start)
         elif STATE.speaker_mode == "auto":
             speaker = "ME"
         else:
@@ -433,43 +555,26 @@ async def start_session() -> None:
         keywords=keywords,
     )
 
-    t1 = asyncio.create_task(
-        run_deepgram(cfg=mic_cfg, audio_queue=mic_q, on_event=on_mic, stop_event=stop_event, tag="mic"),
-        name="deepgram-mic",
-    )
-    t2 = asyncio.create_task(
-        run_deepgram(cfg=loop_cfg, audio_queue=loop_q, on_event=on_loop, stop_event=stop_event, tag="loopback"),
-        name="deepgram-loopback",
-    )
-
-    STATE.session = RunningSession(
+    sess = RunningSession(
         stop_event=stop_event,
-        tasks=[t1, t2],
         loop_stream=loop_stream,
         loop_thread=loop_thread,
-        mic_queue=mic_q,
         loop_queue=loop_q,
         pa_instance=p,
+        mic_cfg=mic_cfg,
+        retired_stream_ids=STATE.retired_stream_ids,
+        on_mic=on_mic,
     )
+    # The mic Deepgram connection is opened by the first browser chunk (see start_mic_stream)
+    sess.tasks.append(asyncio.create_task(
+        run_deepgram(cfg=loop_cfg, audio_queue=loop_q, on_event=on_loop, stop_event=stop_event, tag="loopback"),
+        name="deepgram-loopback",
+    ))
+
+    STATE.session = sess
     await broadcast({"type": "state", "running": True, "language": STATE.language, **meta})
 
-    async def supervise() -> None:
-        try:
-            await asyncio.gather(t1, t2)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            await broadcast({"type": "error", "message": f"Erreur Deepgram: {e}"})
-        finally:
-            try:
-                async with asyncio.timeout(0.5):
-                    async with STATE.lock:
-                        if STATE.running:
-                            await _stop_locked()
-            except asyncio.TimeoutError:
-                pass
-
-    asyncio.create_task(supervise(), name="supervise")
+    sess.supervisor = asyncio.create_task(_supervise(sess), name="supervise")
 
 
 async def _stop_locked() -> None:
@@ -481,21 +586,20 @@ async def _stop_locked() -> None:
         await push_state()
         return
 
+    if sess.mic_stream_id is not None and sess.mic_stream_id != LEGACY_STREAM_ID:
+        STATE.retired_stream_ids.add(sess.mic_stream_id)
+
+    # Graceful stop: run_deepgram sends CloseStream and drains final transcripts on stop_event
     sess.stop_event.set()
-
-    for t in sess.tasks:
-        try:
+    tasks = list(sess.tasks)
+    if tasks:
+        _, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
+        for t in pending:
             t.cancel()
-        except Exception:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=1.0)
+        except asyncio.TimeoutError:
             pass
-
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*sess.tasks, return_exceptions=True),
-            timeout=2.0
-        )
-    except asyncio.TimeoutError:
-        pass
 
     def cleanup_audio():
         try:
@@ -534,26 +638,47 @@ async def handle_transcript(*, speaker: str, ev: dict[str, Any]) -> None:
         STATE._buffer_append(speaker, text, ts)
 
 
+def _handle_audio_blob(msg: dict[str, Any]) -> None:
+    """Route a browser mic chunk to the current mic stream (synchronous: atomic vs stop/takeover)."""
+    sess = STATE.session
+    if sess is None:
+        return
+    stream_id = str(msg.get("stream_id") or LEGACY_STREAM_ID)
+    if sess.is_retired(stream_id):
+        return  # late chunk from a previous capture / other tab
+    audio_bytes = base64.b64decode(msg.get("data") or "")
+    if not audio_bytes:
+        return
+    if stream_id != sess.mic_stream_id:
+        sess.start_mic_stream(stream_id)
+    chunk_speaker = str(msg.get("speaker") or "").upper()
+    if chunk_speaker in ("ME", "OTHER"):
+        sess.record_speaker(chunk_speaker)
+    sess.mic_queue.put_nowait(audio_bytes)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
+    if not _is_local_request(ws.headers.get("host"), ws.headers.get("origin")):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     STATE.clients.add(ws)
     try:
         await ws.send_text(json.dumps({"type": "state", "running": STATE.running, "language": STATE.language}))
         while True:
-            raw = await ws.receive_text()
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            raw = message.get("text")
+            if raw is None:
+                continue  # binary frame: not part of the protocol, ignore it
             try:
                 msg = json.loads(raw)
-                if msg.get("type") == "audio_blob" and STATE.session is not None:
-                    audio_b64 = msg.get("data", "")
-                    chunk_speaker = msg.get("speaker", "").upper()
-                    if chunk_speaker in ("ME", "OTHER"):
-                        STATE.session.record_speaker(chunk_speaker)
-                    if audio_b64:
-                        audio_bytes = base64.b64decode(audio_b64)
-                        _enqueue_dropping_oldest(STATE.session.mic_queue, audio_bytes)
-            except json.JSONDecodeError:
-                pass
+                if isinstance(msg, dict) and msg.get("type") == "audio_blob":
+                    _handle_audio_blob(msg)
+            except Exception:
+                pass  # malformed message (bad JSON/base64, too deep...): ignore it, keep the connection
     except Exception:
         pass
     finally:
@@ -622,19 +747,43 @@ async def api_set_devices(payload: dict[str, Any]) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+async def _start_locked() -> Optional[str]:
+    """Start a session (caller holds STATE.lock). Returns an error message, or None on success."""
+    if STATE.running:
+        return None
+    try:
+        STATE.running = True
+        await start_session()
+        return None
+    except Exception as e:
+        STATE.running = False
+        await broadcast({"type": "error", "message": str(e)})
+        return str(e)
+
+
+async def _set_language_locked(lang: str) -> Optional[str]:
+    """Switch language, restarting a running session (caller holds STATE.lock).
+
+    Returns an error message, or None on success.
+    """
+    STATE.language = lang
+    if STATE.running:
+        await _stop_locked()
+        await asyncio.sleep(0.2)
+        error = await _start_locked()
+        if error:
+            return error
+    await push_state()
+    return None
+
+
 @app.post("/api/start")
 async def api_start() -> JSONResponse:
     async with STATE.lock:
-        if STATE.running:
-            return JSONResponse({"ok": True})
-        try:
-            STATE.running = True
-            await start_session()
-            return JSONResponse({"ok": True})
-        except Exception as e:
-            STATE.running = False
-            await broadcast({"type": "error", "message": str(e)})
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        error = await _start_locked()
+        if error:
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
+        return JSONResponse({"ok": True})
 
 
 @app.post("/api/stop")
@@ -642,6 +791,19 @@ async def api_stop() -> JSONResponse:
     async with STATE.lock:
         await _stop_locked()
         return JSONResponse({"ok": True})
+
+
+@app.post("/api/toggle-running")
+async def api_toggle_running() -> JSONResponse:
+    """Start if stopped, stop if running (used by the AutoHotkey script)."""
+    async with STATE.lock:
+        if STATE.running:
+            await _stop_locked()
+        else:
+            error = await _start_locked()
+            if error:
+                return JSONResponse({"ok": False, "error": error}, status_code=400)
+        return JSONResponse({"ok": True, "running": STATE.running})
 
 
 @app.post("/api/reset")
@@ -659,20 +821,21 @@ async def api_language(payload: dict[str, Any]) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "language must be fr|en"}, status_code=400)
 
     async with STATE.lock:
-        STATE.language = lang
-        was_running = STATE.running
-        if was_running:
-            await _stop_locked()
-            await asyncio.sleep(0.2)
-            try:
-                STATE.running = True
-                await start_session()
-            except Exception as e:
-                STATE.running = False
-                await broadcast({"type": "error", "message": str(e)})
-                return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-        await push_state()
+        error = await _set_language_locked(lang)
+        if error:
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
         return JSONResponse({"ok": True})
+
+
+@app.post("/api/toggle-language")
+async def api_toggle_language() -> JSONResponse:
+    """Switch fr <-> en (used by the AutoHotkey script)."""
+    async with STATE.lock:
+        lang = "en" if STATE.language == "fr" else "fr"
+        error = await _set_language_locked(lang)
+        if error:
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
+        return JSONResponse({"ok": True, "language": STATE.language})
 
 
 @app.post("/api/speaker")
@@ -792,7 +955,14 @@ async def api_list_meetings() -> JSONResponse:
 async def api_new_meeting(payload: dict[str, Any] = None) -> JSONResponse:
     async with STATE.lock:
         name = (payload or {}).get("name", "").strip() if payload else ""
-        meeting_id = _sanitize_meeting_name(name) if name else _generate_meeting_id()
+        if name:
+            meeting_id = _sanitize_meeting_name(name)
+            if _get_meeting_file(meeting_id).exists():
+                return JSONResponse(
+                    {"ok": False, "error": "Un meeting avec ce nom existe déjà"}, status_code=409
+                )
+        else:
+            meeting_id = _unique_meeting_id(_generate_meeting_id())
 
         STATE.current_meeting = meeting_id
         STATE.history = []
@@ -804,9 +974,10 @@ async def api_new_meeting(payload: dict[str, Any] = None) -> JSONResponse:
 
 @app.post("/api/meetings/load")
 async def api_load_meeting(payload: dict[str, Any]) -> JSONResponse:
-    meeting_id = str(payload.get("id", "")).strip()
-    if not meeting_id:
+    raw_id = str(payload.get("id", "")).strip()
+    if not raw_id:
         return JSONResponse({"ok": False, "error": "meeting id required"}, status_code=400)
+    meeting_id = _sanitize_meeting_name(raw_id)
 
     async with STATE.lock:
         STATE.load_meeting(meeting_id)
@@ -822,7 +993,8 @@ async def api_load_meeting(payload: dict[str, Any]) -> JSONResponse:
 
 @app.delete("/api/meetings/{meeting_id}")
 async def api_delete_meeting(meeting_id: str) -> JSONResponse:
-    if meeting_id == STATE.current_meeting:
+    # Compare sanitized ids, case-insensitively: both map to the same file on Windows
+    if _sanitize_meeting_name(meeting_id).casefold() == _sanitize_meeting_name(STATE.current_meeting).casefold():
         return JSONResponse({"ok": False, "error": "cannot delete current meeting"}, status_code=400)
 
     if _delete_meeting(meeting_id):
