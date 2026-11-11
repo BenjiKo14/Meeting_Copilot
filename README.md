@@ -7,7 +7,7 @@ Outil local Windows pour t'aider pendant un entretien ou une discussion Teams :
   - **OTHER** : audio système (Teams, Zoom, etc.) via WASAPI loopback
 - **Gestion de meetings** : sauvegarde et chargement de l'historique des conversations
 - **Profils personnels** : charge ton CV/infos pour des réponses contextualisées
-- **Suggestions IA** via OpenAI (gpt-4o recommandé) :
+- **Suggestions IA** via Google Gemini (`gemini-3.6-flash` recommandé) :
   - Meilleure réponse concise
   - Alternative plus détaillée
   - Question de clarification
@@ -17,10 +17,10 @@ Outil local Windows pour t'aider pendant un entretien ou une discussion Teams :
 ## Prérequis
 
 - Windows 10/11
-- Python 3.10+
+- Python 3.11+ (requis par google-genai 3.x)
 - Navigateur moderne (Chrome, Firefox, Edge)
 - Clé API Deepgram (`DEEPGRAM_API_KEY`)
-- Clé API OpenAI (`OPENAI_API_KEY`)
+- Clé API Gemini (`GEMINI_API_KEY`), à créer gratuitement sur [Google AI Studio](https://aistudio.google.com/apikey)
 
 ## Installation
 
@@ -39,32 +39,36 @@ Copier `.env.example` vers `.env` et renseigner :
 
 ```env
 DEEPGRAM_API_KEY=ta_clé_deepgram
-OPENAI_API_KEY=ta_clé_openai
-OPENAI_MODEL=gpt-4o
+GEMINI_API_KEY=ta_clé_gemini
+GEMINI_MODEL=gemini-3.6-flash
 ```
 
-> **Note** : `gpt-4o` est recommandé car il suit mieux les instructions et n'invente pas de faux faits. `gpt-4o-mini` est moins cher mais peut "halluciner".
+> **Note** : `gemini-3.6-flash` (dernier Flash "Stable") est recommandé : rapide et fiable pour suivre les consignes. `gemini-3.8-flash` est plus récent mais pas encore "Stable" ; `gemini-3.1-pro-preview` (Pro, preview) est plus lent et plus cher. Si `GEMINI_MODEL` est vide, `gemini-3.6-flash` est utilisé.
+
+> **Confidentialité** : avec l'offre gratuite de l'API Gemini, Google peut utiliser les prompts pour améliorer ses produits. Pour des entretiens réels, préfère une clé rattachée à un projet avec facturation activée.
 
 ### 3. Configurer le loopback audio
 
-Lister les devices audio :
+Rien à renseigner dans `.env` : le loopback (OTHER) est **détecté automatiquement** à partir du **périphérique de sortie par défaut de Windows**.
+
+Avant de lancer une session, mets comme sortie par défaut (Paramètres Windows → Son → Sortie) le casque/haut-parleurs où tu entends Teams, et vérifie que Teams utilise bien ce même périphérique.
+
+Pour diagnostiquer, tu peux lister les devices audio :
 
 ```powershell
 python -m backend.audio_devices
 ```
 
-Dans `.env`, renseigne `LOOPBACK_DEVICE` avec l'index ou le nom du périphérique de **sortie** audio (casque/haut-parleurs où tu entends Teams) :
-
-```env
-LOOPBACK_DEVICE=4
-```
+> Cette commande sert uniquement au diagnostic, elle ne configure rien.
 
 > Le micro n'a plus besoin d'être configuré ici — le navigateur te demandera quel micro utiliser.
 
 ## Lancer
 
+Double-clique sur `start.bat` (vérifie `.venv`, `.env` et les dépendances, lance le serveur et ouvre le navigateur), ou en ligne de commande :
+
 ```powershell
-.\.venv\Scripts\uvicorn backend.app:app --host 127.0.0.1 --port 8001 --reload
+.\.venv\Scripts\python -m uvicorn backend.app:app --host 127.0.0.1 --port 8001
 ```
 
 Puis ouvre dans ton navigateur :
@@ -120,11 +124,14 @@ hotkeys/meeting-copilot.ahk
 | `Ctrl+Alt+L` | Toggle FR/EN |
 | `Ctrl+Alt+S` | Start/Stop |
 
+> Les raccourcis basculent en fonction de l'**état réel du serveur** (langue, session en cours) : ils restent cohérents avec les actions faites depuis l'interface web.
+
 ## Dépannage
 
 ### OTHER ne transcrit rien
-- Vérifie que `LOOPBACK_DEVICE` pointe vers le bon périphérique de sortie
+- Vérifie que le périphérique de sortie **par défaut** de Windows est bien celui où tu entends Teams (le loopback est détecté à partir de celui-ci)
 - Assure-toi que Teams utilise bien ce périphérique audio
+- Lance `python -m backend.audio_devices` pour vérifier que le périphérique est visible
 
 ### Erreur WASAPI
 - Utilise un device géré par WASAPI (Windows Audio Session API)
@@ -135,8 +142,12 @@ hotkeys/meeting-copilot.ahk
 - Vérifie que le bon micro est sélectionné dans le popup du navigateur
 
 ### Les réponses LLM inventent des infos
-- Utilise `gpt-4o` au lieu de `gpt-4o-mini`
+- Utilise un modèle Gemini "Stable" récent (`gemini-3.6-flash`) ; pour plus de rigueur, essaie `gemini-3.1-pro-preview` (plus lent)
+- Évite les anciens modèles `gemini-2.5-*` (dépréciés)
 - Vérifie que ton profil contient les infos pertinentes
+
+### Erreur `Missing env var: GEMINI_API_KEY`
+- Renseigne `GEMINI_API_KEY` dans `.env` puis relance le serveur
 
 ## Structure du projet
 
@@ -146,7 +157,7 @@ interview/
 │   ├── __init__.py         # Module Python
 │   ├── app.py              # Serveur FastAPI principal
 │   ├── deepgram_stream.py  # Client Deepgram WebSocket
-│   ├── openai_suggest.py   # Génération de suggestions
+│   ├── gemini_suggest.py   # Génération de suggestions (Gemini)
 │   ├── audio_devices.py    # Liste les périphériques audio
 │   └── requirements.txt
 ├── web/
@@ -156,7 +167,7 @@ interview/
 ├── hotkeys/
 │   └── meeting-copilot.ahk # Raccourcis AutoHotkey
 ├── keywords.txt            # Mots à booster (optionnel)
-├── .env                    # Configuration (clés API, devices)
+├── .env                    # Configuration (clés API, modèle, langue)
 └── README.md
 ```
 
@@ -164,5 +175,5 @@ interview/
 
 - Les transcriptions sont stockées localement dans `meetings/`
 - L'audio n'est pas enregistré, seul le texte est sauvegardé
-- Les données sont envoyées à Deepgram (transcription) et OpenAI (suggestions)
+- Les données sont envoyées à Deepgram (transcription) et Google Gemini (suggestions)
 - Vérifie le cadre légal/consentement selon ton contexte

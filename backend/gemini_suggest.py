@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from pydantic import BaseModel
+
 
 @dataclass(frozen=True)
 class Suggestions:
@@ -14,6 +16,21 @@ class Suggestions:
     technical_terms: list[dict[str, str]]  # List of {term, explanation}
 
 
+class _TechTerm(BaseModel):
+    term: str
+    explanation: str
+
+
+class _SuggestionsSchema(BaseModel):
+    # Structured-output schema sent to Gemini (response_schema). No docstring: it would be sent as the schema description.
+    best: str
+    alternative: str
+    clarifying_question: Optional[str]
+    technical_terms: list[_TechTerm]
+
+
+DEFAULT_MODEL = "gemini-3.6-flash"
+
 # Lazily-created shared client (avoids per-call construction and reuses the HTTP pool)
 _client: Any = None
 
@@ -21,9 +38,16 @@ _client: Any = None
 def _get_client():
     global _client
     if _client is None:
-        from openai import OpenAI  # type: ignore
-        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing env var: GEMINI_API_KEY")
+        from google import genai  # type: ignore
+        _client = genai.Client(api_key=api_key)
     return _client
+
+
+def _model() -> str:
+    return os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
 
 
 def _system_prompt(lang: str, profile: str = "") -> str:
@@ -172,10 +196,42 @@ def _normalize(obj: dict[str, Any]) -> Suggestions:
     )
 
 
+def _response_text_or_raise(resp: Any) -> str:
+    """Return the response text, or raise with the block/finish reason if empty."""
+    text = (resp.text or "").strip()
+    if text:
+        return text
+
+    details = []
+    feedback = resp.prompt_feedback
+    if feedback is not None:
+        if feedback.block_reason:
+            details.append(f"block_reason={feedback.block_reason}")
+        if feedback.block_reason_message:
+            details.append(f"block_reason_message={feedback.block_reason_message}")
+    if resp.candidates:
+        candidate = resp.candidates[0]
+        if candidate.finish_reason:
+            details.append(f"finish_reason={candidate.finish_reason}")
+        if candidate.finish_message:
+            details.append(f"finish_message={candidate.finish_message}")
+    else:
+        details.append("no candidates")
+    raise RuntimeError(f"Empty Gemini response ({', '.join(details)})")
+
+
+def _response_to_dict(resp: Any) -> dict[str, Any]:
+    """Structured output: prefer the SDK-validated `parsed`, else parse the raw text."""
+    if isinstance(resp.parsed, _SuggestionsSchema):
+        return resp.parsed.model_dump()
+    return _extract_json(_response_text_or_raise(resp))
+
+
 def generate_chat_response(*, lang: str, transcript: str, profile: str = "", question: str) -> str:
     """Answer a free-form question about the conversation."""
+    from google.genai import types  # type: ignore
+
     client = _get_client()
-    model = os.getenv("OPENAI_MODEL") or "gpt-4o"
 
     if lang == "en":
         system = (
@@ -196,36 +252,36 @@ def generate_chat_response(*, lang: str, transcript: str, profile: str = "", que
             system += f"\n\n=== PROFIL DU CANDIDAT ===\n{profile}\n=== FIN PROFIL ==="
         user_msg = f"Transcription de la conversation:\n{transcript}\n\nQuestion: {question}"
 
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.4,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_msg},
-        ],
+    resp = client.models.generate_content(
+        model=_model(),
+        contents=user_msg,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=0.4,
+        ),
     )
 
-    return (resp.choices[0].message.content or "").strip()
+    return _response_text_or_raise(resp)
 
 
 def generate_suggestions(*, lang: str, transcript: str, profile: str = "") -> Suggestions:
     """
     Synchronous helper. Called from FastAPI threadpool (to avoid blocking event loop).
-    Uses OpenAI Chat Completions with JSON output.
+    Uses Gemini generate_content with structured JSON output.
     """
-    client = _get_client()
-    model = os.getenv("OPENAI_MODEL") or "gpt-4o"
+    from google.genai import types  # type: ignore
 
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.3,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": _system_prompt(lang, profile)},
-            {"role": "user", "content": _user_prompt(lang, transcript)},
-        ],
+    client = _get_client()
+
+    resp = client.models.generate_content(
+        model=_model(),
+        contents=_user_prompt(lang, transcript),
+        config=types.GenerateContentConfig(
+            system_instruction=_system_prompt(lang, profile),
+            temperature=0.3,
+            response_mime_type="application/json",
+            response_schema=_SuggestionsSchema,
+        ),
     )
 
-    content = (resp.choices[0].message.content or "").strip()
-    data = _extract_json(content)
-    return _normalize(data)
+    return _normalize(_response_to_dict(resp))

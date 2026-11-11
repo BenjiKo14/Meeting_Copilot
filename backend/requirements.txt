@@ -2,7 +2,9 @@ fastapi
 uvicorn[standard]
 websockets
 PyAudioWPatch
+sounddevice
 numpy
 scipy
 python-dotenv
-openai
+google-genai>=3.1
+pydantic

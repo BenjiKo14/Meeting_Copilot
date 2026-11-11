@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.deepgram_stream import DeepgramConfig, run_deepgram
-from backend.openai_suggest import generate_suggestions, generate_chat_response
+from backend.gemini_suggest import generate_suggestions, generate_chat_response
 
 
 load_dotenv()
@@ -903,7 +903,7 @@ async def api_ask() -> JSONResponse:
         await broadcast(msg)
         return JSONResponse({"ok": True})
     except Exception as e:
-        await broadcast({"type": "error", "message": f"Erreur OpenAI: {e}"})
+        await broadcast({"type": "error", "message": f"Erreur Gemini: {e}"})
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
