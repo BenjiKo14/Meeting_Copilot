@@ -14,23 +14,35 @@ class Suggestions:
     technical_terms: list[dict[str, str]]  # List of {term, explanation}
 
 
+# Lazily-created shared client (avoids per-call construction and reuses the HTTP pool)
+_client: Any = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        from openai import OpenAI  # type: ignore
+        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _client
+
+
 def _system_prompt(lang: str, profile: str = "") -> str:
     profile_section = ""
     if profile:
         if lang == "en":
             profile_section = (
                 f"\n\n=== CANDIDATE PROFILE (ME) ===\n{profile}\n"
-                "=== END PROFILE ===\n\n"
+                "=== END PROFILE ===\n"
             )
         else:
             profile_section = (
                 f"\n\n=== PROFIL DU CANDIDAT (ME) ===\n{profile}\n"
-                "=== FIN PROFIL ===\n\n"
+                "=== FIN PROFIL ===\n"
             )
-    
+
     if lang == "en":
         base = (
-            "You are a real-time interview assistant. You help ME reply to OTHER (recruiter/employer).\n\n"
+            "You are a real-time interview assistant. You help ME reply to OTHER (recruiter/employer).\n"
             f"{profile_section}"
             "🚨 CRITICAL RULES 🚨\n\n"
             "1. ALWAYS ANSWER TECHNICAL QUESTIONS\n"
@@ -50,7 +62,7 @@ def _system_prompt(lang: str, profile: str = "") -> str:
         )
     else:
         base = (
-            "Tu es un assistant d'entretien en temps réel. Tu aides ME à répondre à OTHER (recruteur/employeur).\n\n"
+            "Tu es un assistant d'entretien en temps réel. Tu aides ME à répondre à OTHER (recruteur/employeur).\n"
             f"{profile_section}"
             "🚨 RÈGLES CRITIQUES 🚨\n\n"
             "1. TOUJOURS RÉPONDRE AUX QUESTIONS TECHNIQUES\n"
@@ -130,16 +142,16 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 def _normalize(obj: dict[str, Any]) -> Suggestions:
     best = str(obj.get("best") or "").strip()
-    
+
     # Single alternative (longer/more complete)
     alternative = str(obj.get("alternative") or "").strip()
-    
+
     # Clarifying question
     cq = obj.get("clarifying_question")
     cq_s = None
     if cq is not None:
         cq_s = str(cq).strip() or None
-    
+
     # Technical terms explanations
     terms_raw = obj.get("technical_terms") or []
     if not isinstance(terms_raw, list):
@@ -151,41 +163,37 @@ def _normalize(obj: dict[str, Any]) -> Suggestions:
             explanation = str(t.get("explanation") or "").strip()
             if term and explanation:
                 technical_terms.append({"term": term, "explanation": explanation})
-    
+
     return Suggestions(
-        best=best, 
-        alternative=alternative, 
+        best=best,
+        alternative=alternative,
         clarifying_question=cq_s,
         technical_terms=technical_terms
     )
 
 
 def generate_chat_response(*, lang: str, transcript: str, profile: str = "", question: str) -> str:
-    """
-    Answer a free-form question about the conversation.
-    """
-    api_key = os.environ["OPENAI_API_KEY"]
-    model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
+    """Answer a free-form question about the conversation."""
+    client = _get_client()
+    model = os.getenv("OPENAI_MODEL") or "gpt-4o"
 
     if lang == "en":
         system = (
             "You are a helpful interview assistant. You have access to the conversation transcript and the candidate's profile.\n"
             "Answer the user's question based on this context. Be concise and helpful.\n"
-            "If the question is about strategy, give practical advice for the interview.\n"
-            f"\n=== CANDIDATE PROFILE ===\n{profile}\n=== END PROFILE ===\n" if profile else ""
+            "If the question is about strategy, give practical advice for the interview."
         )
+        if profile:
+            system += f"\n\n=== CANDIDATE PROFILE ===\n{profile}\n=== END PROFILE ==="
         user_msg = f"Conversation transcript:\n{transcript}\n\nQuestion: {question}"
     else:
         system = (
             "Tu es un assistant d'entretien. Tu as accès à la transcription de la conversation et au profil du candidat.\n"
             "Réponds à la question de l'utilisateur en te basant sur ce contexte. Sois concis et utile.\n"
-            "Si la question concerne la stratégie, donne des conseils pratiques pour l'entretien.\n"
-            f"\n=== PROFIL DU CANDIDAT ===\n{profile}\n=== FIN PROFIL ===\n" if profile else ""
+            "Si la question concerne la stratégie, donne des conseils pratiques pour l'entretien."
         )
+        if profile:
+            system += f"\n\n=== PROFIL DU CANDIDAT ===\n{profile}\n=== FIN PROFIL ==="
         user_msg = f"Transcription de la conversation:\n{transcript}\n\nQuestion: {question}"
 
     resp = client.chat.completions.create(
@@ -205,13 +213,8 @@ def generate_suggestions(*, lang: str, transcript: str, profile: str = "") -> Su
     Synchronous helper. Called from FastAPI threadpool (to avoid blocking event loop).
     Uses OpenAI Chat Completions with JSON output.
     """
-    api_key = os.environ["OPENAI_API_KEY"]
-    model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-
-    # Local import so the module still loads even if dependency missing.
-    from openai import OpenAI  # type: ignore
-
-    client = OpenAI(api_key=api_key)
+    client = _get_client()
+    model = os.getenv("OPENAI_MODEL") or "gpt-4o"
 
     resp = client.chat.completions.create(
         model=model,
@@ -226,4 +229,3 @@ def generate_suggestions(*, lang: str, transcript: str, profile: str = "") -> Su
     content = (resp.choices[0].message.content or "").strip()
     data = _extract_json(content)
     return _normalize(data)
-
